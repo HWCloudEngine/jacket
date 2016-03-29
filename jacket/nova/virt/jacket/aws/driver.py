@@ -147,8 +147,7 @@ ec2_opts = [
                help='The config location for hybrid vm.'),
     cfg.StrOpt('hybrid_service_port',
                default='7127',
-               help='The route gw of the provider network.'),
-    cfg.StrOpt('provider_image_id', default=None)
+               help='The route gw of the provider network.')
     ]
 
 instance_task_map={}
@@ -257,8 +256,9 @@ class AwsEc2Driver(driver.ComputeDriver):
                 raise Exception(_("Must specify access_key_id and "
                                   "secret_key to use aws ec2"))
             self.compute_adapter = adapter.Ec2Adapter(CONF.provider_opts.access_key_id,
-                                                      secret=CONF.provider_opts.secret_key,
-                                                      region=CONF.provider_opts.region, secure=False)
+                                              secret=CONF.provider_opts.secret_key,
+                                              region=CONF.provider_opts.region,
+                                              secure=False)
             self.storage_adapter = adapter.S3Adapter(CONF.provider_opts.access_key_id,
                                                      secret=CONF.provider_opts.secret_key,
                                                      region=CONF.provider_opts.region,
@@ -269,7 +269,6 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         self.provider_security_group_id = None
         self.provider_interfaces = []
-        self.base_ami_id = CONF.provider_opts.provider_image_id
 
         if CONF.provider_opts.driver_type == 'agent':
             self.provider_subnet_data = CONF.provider_opts.subnet_data
@@ -359,10 +358,6 @@ class AwsEc2Driver(driver.ComputeDriver):
                      expected_state=task_states.IMAGE_PENDING_UPLOAD)
 
         self._put_image_info_to_glance(context, image_object_of_hybrid_cloud, update_task_state, instance)
-
-        # TODO, here get the base AMI id from config file, later will replace by image-manager module.
-        provider_image_of_base_vm = self._get_provider_image_by_provider_id(self.base_ami_id)
-        self._set_tag_for_provider_image(provider_image_of_base_vm, image_id)
         LOG.debug('finish do snapshot for create image')
 
     def _put_image_info_to_glance(self, context, image_object, update_task_state, instance):
@@ -397,7 +392,6 @@ class AwsEc2Driver(driver.ComputeDriver):
                                    'image_state': 'available',
                                    'owner_id': instance['project_id'],
                                    'ramdisk_id': instance['ramdisk_id'],
-                                   'provider_image_id': 'ami-a6d104c5'
                                    }
                     }
         if instance['os_type']:
@@ -529,7 +523,7 @@ class AwsEc2Driver(driver.ComputeDriver):
                         name=None, ram=None, disk=None, bandwidth=None,price=None, driver=self.compute_adapter)
 
 
-    def _get_image_id_from_meta(self, image_meta):
+    def _get_image_id_from_meta(self,image_meta):
         if 'id' in image_meta:
             # create from image
             return image_meta['id']
@@ -561,79 +555,75 @@ class AwsEc2Driver(driver.ComputeDriver):
         while (not provider_image) and retry_time>0:
             provider_image = self._get_provider_image(image_meta)
             retry_time = retry_time-1
-        if provider_image is None:
+        if provider_image  is None:
             image_uuid = self._get_image_id_from_meta(image_meta)
             LOG.error('Get image %s error at provider cloud' % image_uuid)
             return
 
         # 1. if provider_image do not exist,, import image first
         vm_task_state = instance.task_state
-        try:
-            if not provider_image:
-                LOG.debug('begin import image')
-                #save the original state
+        if not provider_image :
+            LOG.debug('begin import image')
+            #save the original state
+           
+            self._update_vm_task_state(
+                instance,
+                task_state=aws_task_states.IMPORTING_IMAGE)
+            image_uuid = self._get_image_id_from_meta(image_meta)
+            container = self.storage_adapter.get_container(CONF.provider_opts.storage_tmp_dir)
 
-                self._update_vm_task_state(
-                    instance,
-                    task_state=aws_task_states.IMPORTING_IMAGE)
-                image_uuid = self._get_image_id_from_meta(image_meta)
-                container = self.storage_adapter.get_container(CONF.provider_opts.storage_tmp_dir)
-
-                try:
-                    self.storage_adapter.get_object(container.name, image_uuid)
-                except ObjectDoesNotExistError:
-                    # 1.1 download qcow2 file from glance
+            try:
+                self.storage_adapter.get_object(container.name,image_uuid)
+            except ObjectDoesNotExistError:
+                # 1.1 download qcow2 file from glance
 
 
-                    this_conversion_dir = '%s/%s' % (CONF.provider_opts.conversion_dir,image_uuid)
-                    orig_file_full_name = '%s/%s.qcow2' % (this_conversion_dir,'orig_file')
-                    fileutils.ensure_tree(this_conversion_dir)
-                    self.glance_api.download(context, image_uuid, dest_path=orig_file_full_name)
+                this_conversion_dir = '%s/%s' % (CONF.provider_opts.conversion_dir,image_uuid)
+                orig_file_full_name = '%s/%s.qcow2' % (this_conversion_dir,'orig_file')
+                fileutils.ensure_tree(this_conversion_dir)
+                self.glance_api.download(context,image_uuid,dest_path=orig_file_full_name)
 
-                    # 1.2 convert to provider image format
-                    converted_file_format = 'vmdk'
-                    converted_file_name = '%s.%s' % ('converted_file', converted_file_format)
-                    converted_file_full_name =  '%s/%s' % (this_conversion_dir,converted_file_name)
+                # 1.2 convert to provider image format
+                converted_file_format = 'vmdk'
+                converted_file_name = '%s.%s' % ('converted_file', converted_file_format)
+                converted_file_full_name =  '%s/%s' % (this_conversion_dir,converted_file_name)
 
-                    convert_image(orig_file_full_name,
-                                  converted_file_full_name,
-                                  converted_file_format,
-                                  subformat='streamoptimized')
+                convert_image(orig_file_full_name,
+                              converted_file_full_name,
+                              converted_file_format,
+                              subformat='streamoptimized')
 
-                # 1.3 upload to provider_image_id
+            # 1.3 upload to provider_image_id
+            
+                object_name = image_uuid
+                extra = {'content_type': 'text/plain'}
 
-                    object_name = image_uuid
-                    extra = {'content_type': 'text/plain'}
+                with open(converted_file_full_name,'rb') as f:
+                    obj = self.storage_adapter.upload_object_via_stream(container=container,
+                                                               object_name=object_name,
+                                                               iterator=f,
+                                                               extra=extra)
 
-                    with open(converted_file_full_name,'rb') as f:
-                        obj = self.storage_adapter.upload_object_via_stream(container=container,
-                                                                   object_name=object_name,
-                                                                   iterator=f,
-                                                                   extra=extra)
-
-                task = self.compute_adapter.create_import_image_task(CONF.provider_opts.storage_tmp_dir,
-                                                             image_uuid,
-                                                             image_name=image_uuid)
-                try:
-                    task_list = instance_task_map[instance.uuid]
-                    if not task_list:
-                        task_list.append(task)
-                        instance_task_map[instance.uuid]=task_list
-                except KeyError:
-                    task_list=[task]
+            task = self.compute_adapter.create_import_image_task(CONF.provider_opts.storage_tmp_dir,
+                                                         image_uuid,
+                                                         image_name=image_uuid)
+            try:
+                task_list = instance_task_map[instance.uuid]
+                if not task_list:
+                    task_list.append(task)
                     instance_task_map[instance.uuid]=task_list
+            except KeyError: 
+                task_list=[task]
+                instance_task_map[instance.uuid]=task_list
+                
+            while not task.is_completed():
+                time.sleep(5)
+                task = self.compute_adapter.get_task_info(task)
 
-                while not task.is_completed():
-                    time.sleep(5)
-                    task = self.compute_adapter.get_task_info(task)
-
-                provider_image = self.compute_adapter.get_image(task.image_id)
-                set_tag_func = getattr(self.compute_adapter, 'ex_create_tags')
-                if set_tag_func:
-                    set_tag_func(provider_image, {'hybrid_cloud_image_id': image_uuid})
-        except Exception, e:
-            LOG.error('Error when import image, exception: %s' % traceback.format_exc(e))
-            raise e
+            provider_image = self.compute_adapter.get_image(task.image_id)
+            set_tag_func = getattr(self.compute_adapter, 'ex_create_tags')
+            if set_tag_func:
+                set_tag_func(provider_image, {'hybrid_cloud_image_id': image_uuid})
 
         # 2.1 map flovar to node size, from configuration
         provider_size = self._get_provider_node_size(instance.get_flavor())
@@ -985,7 +975,7 @@ class AwsEc2Driver(driver.ComputeDriver):
         else:
             return orig_name.replace('/dev/vd', '/dev/sd')
 
-    def _wait_for_snapshot_completed(self, provider_id_list):
+    def  _wait_for_snapshot_completed(self, provider_id_list):
 
         is_all_completed = False
 
@@ -1074,19 +1064,6 @@ class AwsEc2Driver(driver.ComputeDriver):
                         'so did not set tag for provider_volume: %s with hybrid cloud volume id: %s') %\
             (provider_volume, volume_id)
 
-    @RetryDecorator(max_retry_count=10, inc_sleep_time=5, max_sleep_time=60, exceptions=(Exception))
-    def _set_tag_for_provider_image(self, provider_image, hybrid_cloud_image_id):
-        LOG.debug('start to set tag for provider image')
-        set_tag_func = getattr(self.compute_adapter, 'ex_create_tags')
-        if set_tag_func:
-            set_tag_func(provider_image, {'hybrid_cloud_image_id': hybrid_cloud_image_id})
-        else:
-            LOG.warning('No ex_create_tags function, '
-                        'so did not set tag for provider_image: %s with hybrid cloud image id: %s') %\
-            (provider_image, hybrid_cloud_image_id)
-        LOG.debug('end to set tag for provider image, tag name is: %s, value is: %s' %
-                  ('hybrid_cloud_image_id', hybrid_cloud_image_id))
-
     def _create_node(self, instance, provider_node_name, provider_image, provider_size, provider_bdms, user_data):
         try:
 
@@ -1165,58 +1142,6 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         return provider_node
 
-    def _create_hypervm_from_image(self, context, instance, image_meta, injected_files,
-                                        admin_password, network_info, block_device_info):
-        LOG.debug('start to create hypervm_from_image')
-        LOG.debug('image meta is: %s' % image_meta)
-        vm_task_state = instance.task_state
-        provider_image = None
-        retry_time = 3
-        while (not provider_image) and retry_time > 0:
-            # if can found the taged provider image, then use it directly.
-            provider_image = self._get_provider_image(image_meta)
-
-            # if not found taged provider image, use base ami in stead.
-            if not provider_image:
-                provider_image = self._get_provider_image_by_provider_id(self.base_ami_id)
-
-            retry_time -= 1
-            time.sleep(1)
-        if provider_image is None:
-            image_uuid = self._get_image_id_from_meta(image_meta)
-            LOG.error('Get image %s error at provider cloud' % image_uuid)
-            return
-
-        LOG.debug('provider_image: %s' % provider_image)
-        provider_size = self._get_provider_node_size(instance.get_flavor())
-        LOG.debug('privoder size: %s' % provider_size)
-        provider_node_name = self._generate_provider_node_name(instance)
-        LOG.debug('provider_node_name: %s' % provider_node_name)
-
-        user_data = self._generate_user_data(instance)
-
-        LOG.debug('Start to create node.')
-        provider_bdms = None
-        provider_node = self._create_node(instance,
-                                          provider_node_name,
-                                          provider_image,
-                                          provider_size,
-                                          provider_bdms,
-                                          user_data)
-        LOG.debug('node: %s' % provider_node)
-        LOG.debug('-------------Start to create hyper service container.-------------')
-        self._create_hyper_service_container(context,
-                                             instance,
-                                             provider_node,
-                                             network_info,
-                                             block_device_info,
-                                             image_meta,
-                                             injected_files, admin_password)
-        LOG.debug('-------------SUCCESS to create hyper service container.---------------')
-
-        # reset the original state
-        self._update_vm_task_state(instance, task_state=vm_task_state)
-
     def _create_hypervm_from_volume(self, context, instance, image_meta, injected_files,
                                         admin_password, network_info, block_device_info):
         LOG.debug('Start to create hypervm from volume')
@@ -1245,10 +1170,9 @@ class AwsEc2Driver(driver.ComputeDriver):
         LOG.debug('image name of boot volume is: %s' % image_name)
 
         provider_image = self._get_provider_image_by_id(image_id)
-
         LOG.debug('provider_image: %s' % provider_image)
         provider_size = self._get_provider_node_size(instance.get_flavor())
-        LOG.debug('provider size: %s' % provider_size)
+        LOG.debug('privoder size: %s' % provider_size)
         provider_node_name = self._generate_provider_node_name(instance)
         LOG.debug('provider_node_name: %s' % provider_node_name)
 
@@ -1556,11 +1480,7 @@ class AwsEc2Driver(driver.ComputeDriver):
                     raise exception_ex.MultiVolumeConfusion
         else:
             # if boot from image: (import image in provider cloud, then boot instance)
-            if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
-                self._create_hypervm_from_image(context, instance, image_meta, injected_files,
-                                                           admin_password, network_info, block_device_info)
-            else:
-                self._spawn_from_image(context, instance, image_meta, injected_files,
+            self._spawn_from_image(context, instance, image_meta, injected_files,
                                     admin_password, network_info, block_device_info)
         LOG.debug("creating instance %s success!" % instance.uuid)
 
@@ -1598,7 +1518,7 @@ class AwsEc2Driver(driver.ComputeDriver):
             LOG.error(e.message)
             return None
 
-    def _get_provider_image(self, image_obj):
+    def _get_provider_image(self,image_obj):
 
         try:
             image_uuid = self._get_image_id_from_meta(image_obj)
@@ -1619,35 +1539,15 @@ class AwsEc2Driver(driver.ComputeDriver):
             LOG.error('get provider image failed: %s' % e.message)
             return None
 
-    def _get_provider_image_by_provider_id(self, image_id):
-        provider_image = None
-        provider_images = self.compute_adapter.list_images(ex_image_ids=[image_id])
-        if provider_images:
-            if len(provider_images) == 1:
-                provider_image = provider_images[0]
-            elif len(provider_image) > 1:
-                error_info = 'More then one image are found for id: %s' % image_id
-                LOG.error(error_info)
-                raise exception_ex.MultiImageConfusion
-            else:
-                provider_image = None
-        else:
-            provider_image = None
-
-        return provider_image
-
     @RetryDecorator(max_retry_count=3,inc_sleep_time=1,max_sleep_time=60,
                         exceptions=(Exception))
     def _get_provider_image_by_id(self, image_uuid):
         provider_images = self.compute_adapter.list_images(
             ex_filters={'tag:hybrid_cloud_image_id':image_uuid})
-
         if provider_images is None:
-            provider_image = self._get_provider_image_by_provider_id(self.base_ami_id)
-            if provider_image is None:
-                error_info = 'Can NOT get image %s from base ami id' % self.base_ami_id
-                LOG.error(error_info)
-                raise Exception(error_info)
+            error_info = 'Can NOT get image %s from provider cloud tag' % image_uuid
+            LOG.error(error_info)
+            raise Exception(error_info)
         if len(provider_images) == 0:
             error_info = 'Image %s NOT exist at provider cloud' % image_uuid
             LOG.debug(error_info)
@@ -1986,8 +1886,6 @@ class AwsEc2Driver(driver.ComputeDriver):
     def _attache_volume_and_get_new_bdm(self, context, instance, block_device_info, provider_node):
         bdm_list = block_device_info.get('block_device_mapping')
         for bdm in bdm_list:
-            if bdm['boot_index'] == 0:
-                continue
             hybrid_cloud_volume_id = bdm.get('connection_info').get('data').get('volume_id')
             provider_volume_id = self._get_provider_volume_id(context, hybrid_cloud_volume_id)
             # if volume doesn't exist in aws, it need to import volume from image
