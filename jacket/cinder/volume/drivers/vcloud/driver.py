@@ -641,7 +641,6 @@ class VMwareVcloudVolumeDriver(driver.VolumeDriver):
 
             LOG.error('end time of copy_volume_to_image is %s' %
                       (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
-
         else:
             def _unused():
                 # todo(wangfeng)

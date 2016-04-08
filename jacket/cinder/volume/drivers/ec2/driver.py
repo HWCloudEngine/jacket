@@ -17,6 +17,7 @@ from oslo.config import cfg
 #from libcloud.compute.providers import get_driver
 #from libcloud.compute.base import Node
 from adapter import Ec2Adapter as Ec2Adapter
+import adapter
 from libcloud.compute.types import StorageVolumeState,NodeState
 import exception_ex
 import os
@@ -25,6 +26,8 @@ import pdb
 import requests
 from keystoneclient.v2_0 import client as kc
 from libcloud.compute.base import NodeSize
+from wormhole_business import WormHoleBusinessAWS
+from wormholeclient import constants as wormhole_constants
 
 import time
 import string
@@ -79,7 +82,20 @@ ec2api_opts = [
 
     cfg.StrOpt('availability_zone',
                default='ap-southeast-1a',
-               help='the availability_zone for connection to EC2  ')
+               help='the availability_zone for connection to EC2  '),
+
+    cfg.StrOpt('hybrid_service_port',
+               default='7127',
+               help='port of hybrid hyper service'),
+    cfg.StrOpt('subnet_data',
+               default='subnet-804178e5',
+               help='provider subnet id of tunnel bearing net'),
+    cfg.StrOpt('subnet_api',
+               default='subnet-864178e3',
+               help='provider subnet id of external api net'),
+    cfg.StrOpt('base_ami_id',
+               default='ami-a6d104c5',
+               help='id of aim of base vm'),
 ]
 
 vgw_opts = [
@@ -99,7 +115,6 @@ vgw_opts = [
                default='1111',
                help='port of rpc service')      
 ]
-
 
 keystone_opts =[
     cfg.StrOpt('tenant_name',
@@ -124,7 +139,10 @@ CONF.register_opts(vgw_opts,'vgw')
 CONF.register_group(keystone_auth_group)
 CONF.register_opts(keystone_opts,'keystone_authtoken')
 
+CONTAINER_FORMAT_HYBRID_VM = 'hybridvm'
+
 # EC2 = get_driver(CONF.ec2.driver_type)
+
 
 class RetryDecorator(object):
     """Decorator for retrying a function upon suggested exceptions.
@@ -204,6 +222,33 @@ class AwsEc2VolumeDriver(driver.VolumeDriver):
                               "secret_key to use aws ec2"))
         self.adpter = Ec2Adapter(self.configuration.access_key_id, secret=self.configuration.secret_key,
                                  region=self.configuration.region, secure=False)
+
+        self.provider_subnet_data = self.configuration.subnet_data
+        LOG.debug('provider_subnet_data: %s' % self.provider_subnet_data)
+        self.provider_subnet_api = self.configuration.subnet_api
+        LOG.debug('provider_subnet_api: %s' % self.provider_subnet_api)
+        self.base_ami_id = self.configuration.base_ami_id
+        LOG.debug('base_ami_id: %s' % self.base_ami_id)
+
+        if CONF.provider_opts.driver_type == 'agent':
+            # for agent solution by default
+            self.provider_interfaces = []
+            if CONF.provider_opts.subnet_data:
+                provider_interface_data = adapter.NetworkInterface(name='eth_data',
+                                                                   subnet_id=self.provider_subnet_data,
+                                                                   device_index=0)
+                self.provider_interfaces.append(provider_interface_data)
+
+            if CONF.provider_opts.subnet_api:
+                provider_interface_api = adapter.NetworkInterface(name='eth_control',
+                                                                  subnet_id=self.provider_subnet_api,
+                                                                  device_index=1)
+                self.provider_interfaces.append(provider_interface_api)
+        else:
+            if not CONF.provider_opts.security_group:
+                self.provider_security_group_id = None
+            else:
+                self.provider_security_group_id = CONF.provider_opts.security_group
 
     def do_setup(self, context):
         """Instantiate common class and log in storage system."""
@@ -609,7 +654,7 @@ class AwsEc2VolumeDriver(driver.VolumeDriver):
         LOG.error('begin time of copy_volume_to_image is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         container_format=image_meta.get('container_format')
         image_name = image_meta.get('name')
-        file_name=image_meta.get('id')
+        file_name = image_meta.get('id')
         if container_format == 'vgw_url':
             LOG.debug('get the vgw url')
             #vgw_url = CONF.vgw.vgw_url.get(container_format)
@@ -638,7 +683,7 @@ class AwsEc2VolumeDriver(driver.VolumeDriver):
                 LOG.error('get provider_volume of volume %s at provider cloud error' % volume_id) 
                 raise exception_ex.ProviderVolumeNotFound(volume_id=volume_id)
             
-            origin_provider_volume_state= provider_volume.extra.get('attachment_status')
+            origin_provider_volume_state = provider_volume.extra.get('attachment_status')
             
             LOG.error('the origin_provider_volume_info is %s' % str(provider_volume.__dict__))
             origin_attach_node_id = None
@@ -731,7 +776,8 @@ class AwsEc2VolumeDriver(driver.VolumeDriver):
                  
                 self.adpter.attach_volume(origin_attach_node, provider_volume,
                                            origin_device_name)
-                
+        elif container_format == CONTAINER_FORMAT_HYBRID_VM:
+            self._copy_volume_to_image_for_hyper_vm(context, volume, image_service, image_meta)
         else:
             if not os.path.exists(self.configuration.provider_image_conversion_dir):
                 fileutils.ensure_tree(self.configuration.provider_image_conversion_dir)
@@ -755,6 +801,250 @@ class AwsEc2VolumeDriver(driver.VolumeDriver):
             finally:
                 fileutils.delete_if_exists(upload_image)
         LOG.error('end time of copy_volume_to_image is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
+
+    def _copy_volume_to_image_for_hyper_vm(self, context, volume, image_service, image_meta):
+        LOG.debug('volume: %s' % volume)
+        LOG.debug('image_meta: %s' % image_meta)
+        provider_volume = self._get_provider_volume_by_tag_hybrid_cloud_volume_id(volume.id)
+
+        if provider_volume.state == StorageVolumeState.AVAILABLE:
+            # create base-vm in aws first.
+            provider_node = self._create_node_for_copy_volume_to_image(volume.id)
+            # attache data volume for user docker container to base-vm.
+            self._attache_volume_and_wait_for_attached(provider_node, provider_volume, '/dev/sdz')
+            port = self.configuration.hybrid_service_port
+            LOG.debug('wormhole port: %s' % port)
+            wormhole_business = WormHoleBusinessAWS(provider_node, self.adpter, port)
+            self._wait_for_hyper_service_up(wormhole_business)
+            self._attache_provider_volume_to_base_vm(provider_node, provider_volume, wormhole_business)
+            self._create_image_into_docker_repository(wormhole_business, image_meta)
+            docker_image_info = wormhole_business.image_info(image_meta['name'], image_meta['id'])
+            LOG.debug('get docker image info: %s' % docker_image_info)
+            docker_image_size = docker_image_info['size']
+            LOG.debug('docker_image_size: %s' % docker_image_size)
+            image_meta['container_format'] = CONTAINER_FORMAT_HYBRID_VM
+            image_meta['size'] = docker_image_size
+            LOG.debug('image_meta with size: %s' % image_meta )
+            self._put_image_info_to_glance(context, image_meta, image_service)
+
+    def _put_image_info_to_glance(self, context, image_metadata, image_service):
+        LOG.debug('start to put image info to glance')
+        LOG.debug('image metadata: %s' % image_metadata)
+
+        # self.glance_api.update(context, image_id, image_metadata)
+        with image_utils.temporary_file() as tmp:
+            with fileutils.file_open(tmp, 'wb+') as f:
+                f.truncate(image_metadata['size'])
+                image_service.update(context, image_metadata['id'], image_metadata, f)
+
+        LOG.debug('success to put image to glance')
+
+    def _create_image_into_docker_repository(self, wormhole_business, image_meta):
+        LOG.debug('start to create image into docker repository')
+        image_name = image_meta['name']
+        LOG.debug('image_name: %s' % image_name)
+        image_id = image_meta['id']
+        LOG.debug('image_id: %s' % image_id)
+        create_image_task = wormhole_business.create_image(image_name, image_id)
+        self._wait_for_task_finish(wormhole_business, create_image_task)
+        LOG.debug('success to create image into docker repository.')
+
+    @RetryDecorator(max_retry_count=50, inc_sleep_time=5, max_sleep_time=60,
+                    exceptions=(exception_ex.RetryException))
+    def _wait_for_task_finish(self, wormhole_business, task):
+        task_finish = False
+        if task['code'] == wormhole_constants.TASK_SUCCESS:
+            return True
+        current_task = wormhole_business.query_task(task)
+        task_code = current_task['code']
+
+        if wormhole_constants.TASK_DOING == task_code:
+            LOG.debug('task is DOING, status: %s' % task_code)
+            raise exception_ex.RetryException(error_info='task status is: %s' % task_code)
+        elif wormhole_constants.TASK_ERROR == task_code:
+            LOG.debug('task is ERROR, status: %s' % task_code)
+            raise Exception('task error, task status is: %s' % task_code)
+        elif wormhole_constants.TASK_SUCCESS == task_code:
+            LOG.debug('task is SUCCESS, status: %s' % task_code)
+            task_finish = True
+        else:
+            raise Exception('UNKNOW ERROR, task status: %s' % task_code)
+
+        LOG.debug('task: %s is finished' % task )
+
+        return task_finish
+
+    def _attache_provider_volume_to_base_vm(self, provider_node, provider_volume, wormhole_business):
+        old_devices_list = self._get_volume_device(wormhole_business)
+        mount_device = '/dev/sdf'
+        self._attache_volume_and_wait_for_attached(provider_node, provider_volume,
+                                                   self._trans_device_name(mount_device))
+        new_devices_list = self._get_volume_device(wormhole_business)
+
+        added_device_list = [device for device in new_devices_list if device not in old_devices_list]
+        added_device = added_device_list[0]
+        wormhole_business.attach_volume(provider_volume.id, added_device, mount_device)
+
+    def _trans_device_name(self, orig_name):
+        if not orig_name:
+            return orig_name
+        else:
+            return orig_name.replace('/dev/vd', '/dev/sd')
+
+    def _get_volume_device(self, wormhole_business):
+        volume_devices = wormhole_business.list_volume()
+        volume_device_list = volume_devices.get('devices')
+
+        return volume_device_list
+
+    def _wait_for_hyper_service_up(self, wormhole_business):
+        """
+        call get version
+        :param wormhole_business:
+        :return:
+        """
+        docker_version = wormhole_business.get_version()
+        LOG.debug('docker version is: %s' % docker_version)
+
+        return docker_version
+
+
+    def _create_node_for_copy_volume_to_image(self, node_name):
+        provider_image = self._get_provider_image_by_provider_id(self.base_ami_id)
+        provider_node_size = 8
+        provider_node = self._create_node(node_name, provider_image, provider_node_size)
+        return provider_node
+
+    def _attache_volume_and_wait_for_attached(self, provider_node, provider_hybrid_volume, device):
+        LOG.debug('Start to attach volume')
+        attache_result = self.adpter.attach_volume(provider_node, provider_hybrid_volume, device)
+        self._wait_for_volume_is_attached(provider_hybrid_volume)
+        LOG.info('end to attache volume: %s' % attache_result)
+
+    def _wait_for_volume_is_attached(self, provider_hybrid_volume):
+        LOG.debug('wait for volume is attached')
+        not_in_status = [StorageVolumeState.ERROR, StorageVolumeState.DELETED, StorageVolumeState.DELETING]
+        status = self._wait_for_volume_in_specified_status(provider_hybrid_volume, StorageVolumeState.INUSE,
+                                                           not_in_status)
+        LOG.debug('volume status: %s' % status)
+        LOG.debug('volume is attached.')
+        return
+
+    def _wait_for_volume_is_available(self, provider_hybrid_volume):
+        LOG.debug('wait for volume is available')
+        not_in_status = [StorageVolumeState.ERROR, StorageVolumeState.DELETED, StorageVolumeState.DELETING]
+        # import pdb; pdb.set_trace()
+        status = self._wait_for_volume_in_specified_status(provider_hybrid_volume, StorageVolumeState.AVAILABLE,
+                                                           not_in_status)
+        LOG.debug('volume status: %s' % status)
+        LOG.debug('volume is available')
+        return status
+
+    @RetryDecorator(max_retry_count=10,inc_sleep_time=5,max_sleep_time=60,exceptions=(exception_ex.RetryException))
+    def _wait_for_volume_in_specified_status(self, provider_hybrid_volume, status, not_in_status_list):
+        """
+
+        :param provider_hybrid_volume:
+        :param status: StorageVolumeState
+        :return: specified_status
+        """
+        LOG.debug('wait for volume in specified status: %s' % status)
+        LOG.debug('not_in_status_list: %s' % not_in_status_list)
+        provider_volume_id = provider_hybrid_volume.id
+        LOG.debug('wait for volume:%s in specified status: %s' % (provider_volume_id, status))
+        created_volumes = self.adpter.list_volumes(ex_volume_ids=[provider_volume_id])
+
+        if not created_volumes:
+            error_info = 'created docker app volume failed.'
+            raise exception_ex.RetryException(error_info=error_info)
+
+        created_volume = created_volumes[0]
+        current_status = created_volume.state
+        LOG.debug('current_status: %s' % current_status)
+        error_info = 'volume: %s status is %s' % (provider_hybrid_volume.id, current_status)
+
+        if status == current_status:
+            LOG.debug('current status: %s is the same with specified status %s ' % (current_status, status))
+        elif not_in_status_list:
+            if status in not_in_status_list:
+                raise Exception(error_info)
+            else:
+                raise exception_ex.RetryException(error_info=error_info)
+        else:
+            raise exception_ex.RetryException(error_info=error_info)
+
+        return current_status
+
+    def _get_provider_image_by_provider_id(self, image_id):
+        provider_image = None
+        provider_images = self.adpter.list_images(ex_image_ids=[image_id])
+        if provider_images:
+            if len(provider_images) == 1:
+                provider_image = provider_images[0]
+            elif len(provider_image) > 1:
+                error_info = 'More then one image are found for id: %s' % image_id
+                LOG.error(error_info)
+                raise Exception(error_info)
+            else:
+                provider_image = None
+        else:
+            provider_image = None
+
+        return provider_image
+
+    def _create_node(self, provider_node_name, provider_image, provider_size):
+        try:
+
+            LOG.info('provider_interfaces: %s' % self.provider_interfaces)
+            if len(self.provider_interfaces) > 1:
+                LOG.debug('Create provider node, length: %s' % len(self.provider_interfaces))
+                provider_node = self.adpter.create_node(name=provider_node_name,
+                                                                 image=provider_image,
+                                                                 size=provider_size,
+                                                                 location=CONF.provider_opts.availability_zone,
+                                                                 ex_network_interfaces=self.provider_interfaces)
+            elif len(self.provider_interfaces) == 1:
+                LOG.debug('Create provider node, length: %s' % len(self.provider_interfaces))
+                provider_subnet_data_id = self.provider_interfaces[0].subnet_id
+                provider_subnet_data = self.adpter.ex_list_subnets(subnet_ids=[provider_subnet_data_id])[0]
+                provider_node = self.adpter.create_node(name=provider_node_name,
+                                                                 image=provider_image,
+                                                                 size=provider_size,
+                                                                 location=CONF.provider_opts.availability_zone,
+                                                                 ex_subnet=provider_subnet_data,
+                                                                 ex_security_group_ids=self.provider_security_group_id)
+            else:
+                LOG.debug('Create provider node, length: %s' % len(self.provider_interfaces))
+                provider_node = self.adpter.create_node(name=provider_node_name,
+                                                                 image=provider_image,
+                                                                 size=provider_size,
+                                                                 location=CONF.provider_opts.availability_zone,
+                                                                 ex_security_group_ids=self.provider_security_group_id)
+
+        except Exception as e:
+            LOG.ERROR('Provider instance is booting error')
+            LOG.error(e.message)
+            provider_node = self.adpter.list_nodes(ex_filters={'tag:name':provider_node_name})
+            if not provider_node:
+                raise e
+            raise e
+        LOG.debug('create node success, provider_node: %s' % provider_node)
+
+        node_is_ok = False
+        while not node_is_ok:
+            provider_nodes = self.adpter.list_nodes(ex_node_ids=[provider_node.id])
+            if not provider_nodes:
+                error_info = 'There is no node created in provider. node id: %s' % provider_node.id
+                LOG.error(error_info)
+                continue
+            else:
+                provider_node = provider_nodes[0]
+                if provider_node.state == NodeState.RUNNING or provider_node.state == NodeState.STOPPED:
+                    LOG.debug('Node %s is created, and status is: %s' % (provider_node.name, provider_node.state))
+                    node_is_ok = True
+            time.sleep(10)
+
+        return provider_node
 
     def _get_provider_node_size(self, flavor):
         return NodeSize(id=CONF.provider_opts.flavor_map[flavor.name],

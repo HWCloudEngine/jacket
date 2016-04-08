@@ -24,12 +24,16 @@ from nova.compute import power_state
 from nova.virt import driver
 from nova.network import neutronv2
 from nova.context import RequestContext
+from nova.compute import utils as compute_utils
+from nova.image import glance
 
 from wormholeclient.client import Client
 from wormholeclient import errors
+from wormholeclient import constants as wormhole_constants
 import traceback
 import adapter
 import exception_ex
+from nova.virt.aws import image_utils
 
 hybrid_cloud_opts = [
 
@@ -143,7 +147,8 @@ ec2_opts = [
                help='The config location for hybrid vm.'),
     cfg.StrOpt('hybrid_service_port',
                default='7127',
-               help='The route gw of the provider network.')
+               help='The route gw of the provider network.'),
+    cfg.StrOpt('provider_image_id', default=None)
     ]
 
 instance_task_map={}
@@ -228,8 +233,8 @@ class RetryDecorator(object):
                     try:
                         return f(*args, **kwargs)
                     except self._exceptions as e:
-                        LOG.error('retry times: %s' % str(self._max_retry_count - max_retries))
-                        LOG.error('exception: %s' % traceback.format_exc(e))
+                        LOG.error('retry times: %s, exception: %s' %
+                                  (str(self._max_retry_count - max_retries), traceback.format_exc(e)))
                         time.sleep(mdelay)
                         max_retries -= 1
                         if mdelay >= self._max_sleep_time:
@@ -252,9 +257,8 @@ class AwsEc2Driver(driver.ComputeDriver):
                 raise Exception(_("Must specify access_key_id and "
                                   "secret_key to use aws ec2"))
             self.compute_adapter = adapter.Ec2Adapter(CONF.provider_opts.access_key_id,
-                                              secret=CONF.provider_opts.secret_key,
-                                              region=CONF.provider_opts.region,
-                                              secure=False)
+                                                      secret=CONF.provider_opts.secret_key,
+                                                      region=CONF.provider_opts.region, secure=False)
             self.storage_adapter = adapter.S3Adapter(CONF.provider_opts.access_key_id,
                                                      secret=CONF.provider_opts.secret_key,
                                                      region=CONF.provider_opts.region,
@@ -265,6 +269,7 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         self.provider_security_group_id = None
         self.provider_interfaces = []
+        self.base_ami_id = CONF.provider_opts.provider_image_id
 
         if CONF.provider_opts.driver_type == 'agent':
             self.provider_subnet_data = CONF.provider_opts.subnet_data
@@ -317,12 +322,97 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         return instances
 
-    def snapshot(self, context, instance, image_id, update_task_state):
+    def volume_snapshot_create(self, context, instance, volume_id,
+                               create_info):
+        pass
 
+    def snapshot(self, context, instance, image_id, update_task_state):
+        LOG.debug('start to do snapshot')
         update_task_state(task_state=task_states.IMAGE_PENDING_UPLOAD)
 
-        self._do_snapshot_2(context, instance, image_id, update_task_state)
+        image_container_type = instance.system_metadata.get('image_container_format')
+        LOG.debug('image container type: %s' % image_container_type)
 
+        if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
+            self._do_snapshot_for_hybrid_vm(context, instance, image_id, update_task_state)
+        else:
+            self._do_snapshot_2(context, instance, image_id, update_task_state)
+
+    def _do_snapshot_for_hybrid_vm(self, context, instance, image_id, update_task_state):
+        image_object_of_hybrid_cloud = self.glance_api.get(context, image_id)
+        LOG.debug('get image object: %s' % image_object_of_hybrid_cloud)
+        clients = self._get_hybrid_service_clients_by_instance(instance)
+        LOG.debug('get clients: %s' % clients)
+
+        # create image in docker repository
+        create_image_task = self._clients_create_image_task(clients, image_object_of_hybrid_cloud)
+        self._wait_for_task_finish(clients, create_image_task)
+        LOG.debug('create image in docker image repository success')
+
+        docker_image_info = self._clients_get_image_info(clients, image_object_of_hybrid_cloud)
+        size = docker_image_info['size']
+        LOG.debug('docker image size: %s' % size)
+        image_object_of_hybrid_cloud['size'] = size
+        LOG.debug('image with size: %s' % image_object_of_hybrid_cloud)
+
+        update_task_state(task_state=task_states.IMAGE_UPLOADING,
+                     expected_state=task_states.IMAGE_PENDING_UPLOAD)
+
+        self._put_image_info_to_glance(context, image_object_of_hybrid_cloud, update_task_state, instance)
+
+        # TODO, here get the base AMI id from config file, later will replace by image-manager module.
+        provider_image_of_base_vm = self._get_provider_image_by_provider_id(self.base_ami_id)
+        self._set_tag_for_provider_image(provider_image_of_base_vm, image_id)
+        LOG.debug('finish do snapshot for create image')
+
+    def _put_image_info_to_glance(self, context, image_object, update_task_state, instance):
+        LOG.debug('start to put image info to glance, image obj: %s' % image_object)
+
+        image_id = image_object['id']
+        LOG.debug('image id: %s' % image_id)
+        image_metadata = self._create_image_metadata(context, instance, image_object)
+        LOG.debug('image metadata: %s' % image_metadata)
+
+        # self.glance_api.update(context, image_id, image_metadata)
+        with image_utils.temporary_file() as tmp:
+            image_service, image_id = glance.get_remote_image_service(context, image_id)
+            with fileutils.file_open(tmp, 'wb+') as f:
+                f.truncate(image_object['size'])
+                image_service.update(context, image_id, image_metadata, f)
+                self._update_vm_task_state(instance, task_state=instance.task_state)
+
+        LOG.debug('success to put image to glance')
+
+    def _create_image_metadata(self, context, instance, image_object):
+
+        base_image_ref = instance['image_ref']
+        base = compute_utils.get_image_metadata(context, self.glance_api, base_image_ref, instance)
+
+        metadata = {'is_public': False,
+                    'status': 'active',
+                    'name': image_object['name'],
+                    'properties': {
+                                   'kernel_id': instance['kernel_id'],
+                                   'image_location': 'snapshot',
+                                   'image_state': 'available',
+                                   'owner_id': instance['project_id'],
+                                   'ramdisk_id': instance['ramdisk_id'],
+                                   'provider_image_id': 'ami-a6d104c5'
+                                   }
+                    }
+        if instance['os_type']:
+            metadata['properties']['os_type'] = instance['os_type']
+
+        # NOTE(vish): glance forces ami disk format to be ami
+        if base.get('disk_format') == 'ami':
+            metadata['disk_format'] = 'ami'
+        else:
+            metadata['disk_format'] = image_object['disk_format']
+
+        metadata['container_format'] = CONTAINER_FORMAT_HYBRID_VM
+        metadata['size'] = image_object['size']
+
+        return metadata
 
     def _do_snapshot_1(self, context, instance, image_id, update_task_state):
 
@@ -439,7 +529,7 @@ class AwsEc2Driver(driver.ComputeDriver):
                         name=None, ram=None, disk=None, bandwidth=None,price=None, driver=self.compute_adapter)
 
 
-    def _get_image_id_from_meta(self,image_meta):
+    def _get_image_id_from_meta(self, image_meta):
         if 'id' in image_meta:
             # create from image
             return image_meta['id']
@@ -452,6 +542,14 @@ class AwsEc2Driver(driver.ComputeDriver):
         else:
             return None
 
+    def _get_image_name_from_meta(self, image_meta):
+        if 'name' in image_meta:
+            return image_meta['name']
+        elif 'image_name' in image_meta:
+            return image_meta['image_name']
+        else:
+            return NodeState
+
     def _spawn_from_image(self, context, instance, image_meta, injected_files,
                                     admin_password, network_info, block_device_info):
         # 0.get provider_image,
@@ -463,78 +561,80 @@ class AwsEc2Driver(driver.ComputeDriver):
         while (not provider_image) and retry_time>0:
             provider_image = self._get_provider_image(image_meta)
             retry_time = retry_time-1
-        if provider_image  is None:
+        if provider_image is None:
             image_uuid = self._get_image_id_from_meta(image_meta)
             LOG.error('Get image %s error at provider cloud' % image_uuid)
             return
 
         # 1. if provider_image do not exist,, import image first
-         
         vm_task_state = instance.task_state
-        if not provider_image :
-            LOG.debug('begin import image')
-            #save the original state
-           
-            self._update_vm_task_state(
-                instance,
-                task_state=aws_task_states.IMPORTING_IMAGE)
-            image_uuid = self._get_image_id_from_meta(image_meta)
-            container = self.storage_adapter.get_container(CONF.provider_opts.storage_tmp_dir)
+        try:
+            if not provider_image:
+                LOG.debug('begin import image')
+                #save the original state
 
-            try:
-                self.storage_adapter.get_object(container.name,image_uuid)
-            except ObjectDoesNotExistError:
-                # 1.1 download qcow2 file from glance
+                self._update_vm_task_state(
+                    instance,
+                    task_state=aws_task_states.IMPORTING_IMAGE)
+                image_uuid = self._get_image_id_from_meta(image_meta)
+                container = self.storage_adapter.get_container(CONF.provider_opts.storage_tmp_dir)
+
+                try:
+                    self.storage_adapter.get_object(container.name, image_uuid)
+                except ObjectDoesNotExistError:
+                    # 1.1 download qcow2 file from glance
 
 
-                this_conversion_dir = '%s/%s' % (CONF.provider_opts.conversion_dir,image_uuid)
-                orig_file_full_name = '%s/%s.qcow2' % (this_conversion_dir,'orig_file')
-                fileutils.ensure_tree(this_conversion_dir)
-                self.glance_api.download(context,image_uuid,dest_path=orig_file_full_name)
+                    this_conversion_dir = '%s/%s' % (CONF.provider_opts.conversion_dir,image_uuid)
+                    orig_file_full_name = '%s/%s.qcow2' % (this_conversion_dir,'orig_file')
+                    fileutils.ensure_tree(this_conversion_dir)
+                    self.glance_api.download(context, image_uuid, dest_path=orig_file_full_name)
 
-                # 1.2 convert to provider image format
-                converted_file_format = 'vmdk'
-                converted_file_name = '%s.%s' % ('converted_file', converted_file_format)
-                converted_file_full_name =  '%s/%s' % (this_conversion_dir,converted_file_name)
+                    # 1.2 convert to provider image format
+                    converted_file_format = 'vmdk'
+                    converted_file_name = '%s.%s' % ('converted_file', converted_file_format)
+                    converted_file_full_name =  '%s/%s' % (this_conversion_dir,converted_file_name)
 
-                convert_image(orig_file_full_name,
-                              converted_file_full_name,
-                              converted_file_format,
-                              subformat='streamoptimized')
+                    convert_image(orig_file_full_name,
+                                  converted_file_full_name,
+                                  converted_file_format,
+                                  subformat='streamoptimized')
 
-            # 1.3 upload to provider_image_id
-            
-                object_name = image_uuid
-                extra = {'content_type': 'text/plain'}
+                # 1.3 upload to provider_image_id
 
-                with open(converted_file_full_name,'rb') as f:
-                    obj = self.storage_adapter.upload_object_via_stream(container=container,
-                                                               object_name=object_name,
-                                                               iterator=f,
-                                                               extra=extra)
+                    object_name = image_uuid
+                    extra = {'content_type': 'text/plain'}
 
-            task = self.compute_adapter.create_import_image_task(CONF.provider_opts.storage_tmp_dir,
-                                                         image_uuid,
-                                                         image_name=image_uuid)
-            try:
-                task_list =instance_task_map[instance.uuid]
-                if not task_list:
-                    task_list.append(task)
+                    with open(converted_file_full_name,'rb') as f:
+                        obj = self.storage_adapter.upload_object_via_stream(container=container,
+                                                                   object_name=object_name,
+                                                                   iterator=f,
+                                                                   extra=extra)
+
+                task = self.compute_adapter.create_import_image_task(CONF.provider_opts.storage_tmp_dir,
+                                                             image_uuid,
+                                                             image_name=image_uuid)
+                try:
+                    task_list = instance_task_map[instance.uuid]
+                    if not task_list:
+                        task_list.append(task)
+                        instance_task_map[instance.uuid]=task_list
+                except KeyError:
+                    task_list=[task]
                     instance_task_map[instance.uuid]=task_list
-            except KeyError: 
-                task_list=[task]
-                instance_task_map[instance.uuid]=task_list
-                
-            while not task.is_completed():
-                time.sleep(5)
-                task = self.compute_adapter.get_task_info(task)
 
-            provider_image = self.compute_adapter.get_image(task.image_id)
-            set_tag_func = getattr(self.compute_adapter, 'ex_create_tags')
-            if set_tag_func:
-                set_tag_func(provider_image, {'hybrid_cloud_image_id': image_uuid})
-                
-           
+                while not task.is_completed():
+                    time.sleep(5)
+                    task = self.compute_adapter.get_task_info(task)
+
+                provider_image = self.compute_adapter.get_image(task.image_id)
+                set_tag_func = getattr(self.compute_adapter, 'ex_create_tags')
+                if set_tag_func:
+                    set_tag_func(provider_image, {'hybrid_cloud_image_id': image_uuid})
+        except Exception, e:
+            LOG.error('Error when import image, exception: %s' % traceback.format_exc(e))
+            raise e
+
         # 2.1 map flovar to node size, from configuration
         provider_size = self._get_provider_node_size(instance.get_flavor())
 
@@ -578,30 +678,30 @@ class AwsEc2Driver(driver.ComputeDriver):
                     continue
                 data_bdm_list.append(bdm)
 
-                connection_info = bdm.get('connection_info',None)
-                volume_id = connection_info['data']['volume_id']
+                if container_format != CONTAINER_FORMAT_HYBRID_VM:
+                    connection_info = bdm.get('connection_info', None)
+                    volume_id = connection_info['data']['volume_id']
 
-                provider_volume_id = self._get_provider_volume_id(context,volume_id)
-                # only if volume DO NOT exist in aws when import volume
-                if not provider_volume_id:
-                    provider_volume_id = self._import_volume_from_glance(
-                        context,
-                        volume_id,
-                        instance,
-                        CONF.provider_opts.availability_zone)
+                    provider_volume_id = self._get_provider_volume_id(context,volume_id)
+                    # only if volume DO NOT exist in aws when import volume
+                    if not provider_volume_id:
+                        provider_volume_id = self._import_volume_from_glance(
+                            context,
+                            volume_id,
+                            instance,
+                            CONF.provider_opts.availability_zone)
 
-                provider_volume_ids.append(provider_volume_id)
+                    provider_volume_ids.append(provider_volume_id)
 
             # 2.5.2 create snapshot
             # if container format is hybridvm, then need to attach volume after create node one by one
             if container_format != CONTAINER_FORMAT_HYBRID_VM:
                 provider_snapshots = []
 
-                if len(provider_volume_ids)>0:
+                if len(provider_volume_ids) > 0:
                     source_provider_volumes = self.compute_adapter.list_volumes(ex_volume_ids=provider_volume_ids)
                     for provider_volume in source_provider_volumes:
-                        provider_snapshots.append(
-                            self.compute_adapter.create_volume_snapshot(provider_volume))
+                        provider_snapshots.append(self.compute_adapter.create_volume_snapshot(provider_volume))
 
                 provider_snapshot_ids = []
                 for snap in provider_snapshots:
@@ -611,7 +711,7 @@ class AwsEc2Driver(driver.ComputeDriver):
 
                 # 2.5.3 create provider bdm list from bdm_info and snapshot
                 provider_bdms = []
-                if len(provider_snapshots)>0:
+                if len(provider_snapshots) > 0:
                     for ii in range(0, len(data_bdm_list)):
                         provider_bdm = {'DeviceName':
                                             self._trans_device_name(data_bdm_list[ii].get('mount_device')),
@@ -702,58 +802,92 @@ class AwsEc2Driver(driver.ComputeDriver):
                 LOG.warning('Provider instance is booting but adapter is failed to get status. Try it later')
             time.sleep(10)
 
-        image_name = image_meta.get('name')
-        LOG.debug('docker container app name is image_name: %s' % image_name)
         if container_format == CONTAINER_FORMAT_HYBRID_VM:
             self._create_hyper_service_container(context,
                                              instance,
                                              provider_node,
                                              network_info,
                                              block_device_info,
-                                             image_name,
-                                             injected_files)
+                                             image_meta,
+                                             injected_files,
+                                             admin_password)
+        else:
+            # 6 mapp data volume id to provider
+            provider_bdm_list = provider_node.extra.get('block_device_mapping')
+            for ii in range(0, len(data_bdm_list)):
+                provider_volume_id = provider_bdm_list[ii+1].get('ebs').get('volume_id')
+                provider_volumes = self.compute_adapter.list_volumes(ex_volume_ids=[provider_volume_id])
 
-        # 6 mapp data volume id to provider
-        provider_bdm_list = provider_node.extra.get('block_device_mapping')
-        for ii in range(0, len(data_bdm_list)):
-            provider_volume_id = provider_bdm_list[ii+1].get('ebs').get('volume_id')
-            provider_volumes = self.compute_adapter.list_volumes(ex_volume_ids=[provider_volume_id])
+                connection_info = data_bdm_list[ii].get('connection_info',[])
+                volume_id = connection_info['data']['volume_id']
 
-            connection_info = data_bdm_list[ii].get('connection_info',[])
-            volume_id = connection_info['data']['volume_id']
+                self._map_volume_to_provider(context, volume_id, provider_volumes[0])
 
-            self._map_volume_to_provider(context, volume_id, provider_volumes[0])
-
-        #delete the  tmp volume
-        for provider_volume in source_provider_volumes:
-            self.compute_adapter.destroy_volume(provider_volume)
+            # delete the  tmp volume
+            for provider_volume in source_provider_volumes:
+                self.compute_adapter.destroy_volume(provider_volume)
           
         #reset the original state
         self._update_vm_task_state(
                 instance,
                 task_state=vm_task_state)
-  
- 
+
         LOG.info('end time of _spawn_from_image is %s' %(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())))
         return provider_node
 
-    def _wait_for_volume_available(self, provider_hybrid_volume):
-        while True:
-            created_volumes = self.compute_adapter.list_volumes(ex_volume_ids=[provider_hybrid_volume.id])
-            if not created_volumes:
-                self._deal_with_spawn_docker_app_failed('created docker app volume failed.')
-            created_volume = created_volumes[0]
-            current_status = created_volume.state
-            if StorageVolumeState.AVAILABLE == current_status:
-                LOG.debug('Volume: %s is %s' % (provider_hybrid_volume.id, current_status))
-                break
-            elif StorageVolumeState.CREATING == current_status:
-                LOG.debug('Volume: %s is %s' % (provider_hybrid_volume.id, current_status))
-                time.sleep(1)
-                continue
+    def _wait_for_volume_is_attached(self, provider_hybrid_volume):
+        LOG.debug('wait for volume is attached')
+        not_in_status = [StorageVolumeState.ERROR, StorageVolumeState.DELETED, StorageVolumeState.DELETING]
+        status = self._wait_for_volume_in_specified_status(provider_hybrid_volume, StorageVolumeState.INUSE,
+                                                           not_in_status)
+        LOG.debug('volume status: %s' % status)
+        LOG.debug('volume is attached.')
+        return
+
+    def _wait_for_volume_is_available(self, provider_hybrid_volume):
+        LOG.debug('wait for volume is available')
+        not_in_status = [StorageVolumeState.ERROR, StorageVolumeState.DELETED, StorageVolumeState.DELETING]
+        # import pdb; pdb.set_trace()
+        status = self._wait_for_volume_in_specified_status(provider_hybrid_volume, StorageVolumeState.AVAILABLE,
+                                                           not_in_status)
+        LOG.debug('volume status: %s' % status)
+        LOG.debug('volume is available')
+        return status
+
+    @RetryDecorator(max_retry_count=10,inc_sleep_time=5,max_sleep_time=60,exceptions=(exception_ex.RetryException))
+    def _wait_for_volume_in_specified_status(self, provider_hybrid_volume, status, not_in_status_list):
+        """
+
+        :param provider_hybrid_volume:
+        :param status: StorageVolumeState
+        :return: specified_status
+        """
+        LOG.debug('wait for volume in specified status: %s' % status)
+        LOG.debug('not_in_status_list: %s' % not_in_status_list)
+        provider_volume_id = provider_hybrid_volume.id
+        LOG.debug('wait for volume:%s in specified status: %s' % (provider_volume_id, status))
+        created_volumes = self.compute_adapter.list_volumes(ex_volume_ids=[provider_volume_id])
+
+        if not created_volumes:
+            error_info = 'created docker app volume failed.'
+            raise exception_ex.RetryException(error_info=error_info)
+
+        created_volume = created_volumes[0]
+        current_status = created_volume.state
+        LOG.debug('current_status: %s' % current_status)
+        error_info = 'volume: %s status is %s' % (provider_hybrid_volume.id, current_status)
+
+        if status == current_status:
+            LOG.debug('current status: %s is the same with specified status %s ' % (current_status, status))
+        elif not_in_status_list:
+            if status in not_in_status_list:
+                raise Exception(error_info)
             else:
-                error_info = 'Volume: %s is %s' % (provider_hybrid_volume.id, current_status)
-                self._deal_with_spawn_docker_app_failed(error_info)
+                raise exception_ex.RetryException(error_info=error_info)
+        else:
+            raise exception_ex.RetryException(error_info=error_info)
+
+        return current_status
 
     def _get_provider_volumes_map_from_bdm(self, context, instance, block_device_info):
         """
@@ -817,7 +951,7 @@ class AwsEc2Driver(driver.ComputeDriver):
                             instance,
                             CONF.provider_opts.availability_zone)
                         created_provider_volume = self._get_provider_volume_by_provider_volume_id(provider_volume_id)
-                        self._set_tag_for_provider_volume(created_provider_volume, volume_id)
+                        self._map_volume_to_provider(context, volume_id, created_provider_volume)
                         provider_volume = self._get_provider_volume(volume_id)
 
                     if provider_volume:
@@ -851,7 +985,7 @@ class AwsEc2Driver(driver.ComputeDriver):
         else:
             return orig_name.replace('/dev/vd', '/dev/sd')
 
-    def  _wait_for_snapshot_completed(self, provider_id_list):
+    def _wait_for_snapshot_completed(self, provider_id_list):
 
         is_all_completed = False
 
@@ -891,12 +1025,6 @@ class AwsEc2Driver(driver.ComputeDriver):
             if bdm['mount_device'] == root_device_name:
                 root_bdm = bdm
                 break
-
-        if root_bdm is None:
-            error_info = 'boot bdm is None.'
-            LOG.error(error_info)
-            raise Exception(error_info)
-
         return root_bdm
 
     def _get_volume_from_bdm(self, context, bdm):
@@ -945,6 +1073,19 @@ class AwsEc2Driver(driver.ComputeDriver):
             LOG.warning('No ex_create_tags function, '
                         'so did not set tag for provider_volume: %s with hybrid cloud volume id: %s') %\
             (provider_volume, volume_id)
+
+    @RetryDecorator(max_retry_count=10, inc_sleep_time=5, max_sleep_time=60, exceptions=(Exception))
+    def _set_tag_for_provider_image(self, provider_image, hybrid_cloud_image_id):
+        LOG.debug('start to set tag for provider image')
+        set_tag_func = getattr(self.compute_adapter, 'ex_create_tags')
+        if set_tag_func:
+            set_tag_func(provider_image, {'hybrid_cloud_image_id': hybrid_cloud_image_id})
+        else:
+            LOG.warning('No ex_create_tags function, '
+                        'so did not set tag for provider_image: %s with hybrid cloud image id: %s') %\
+            (provider_image, hybrid_cloud_image_id)
+        LOG.debug('end to set tag for provider image, tag name is: %s, value is: %s' %
+                  ('hybrid_cloud_image_id', hybrid_cloud_image_id))
 
     def _create_node(self, instance, provider_node_name, provider_image, provider_size, provider_bdms, user_data):
         try:
@@ -1024,70 +1165,57 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         return provider_node
 
-    def _get_provider_bdm_info(self, context, instance, block_device_info):
+    def _create_hypervm_from_image(self, context, instance, image_meta, injected_files,
+                                        admin_password, network_info, block_device_info):
+        LOG.debug('start to create hypervm_from_image')
+        LOG.debug('image meta is: %s' % image_meta)
+        vm_task_state = instance.task_state
+        provider_image = None
+        retry_time = 3
+        while (not provider_image) and retry_time > 0:
+            # if can found the taged provider image, then use it directly.
+            provider_image = self._get_provider_image(image_meta)
+
+            # if not found taged provider image, use base ami in stead.
+            if not provider_image:
+                provider_image = self._get_provider_image_by_provider_id(self.base_ami_id)
+
+            retry_time -= 1
+            time.sleep(1)
+        if provider_image is None:
+            image_uuid = self._get_image_id_from_meta(image_meta)
+            LOG.error('Get image %s error at provider cloud' % image_uuid)
+            return
+
+        LOG.debug('provider_image: %s' % provider_image)
+        provider_size = self._get_provider_node_size(instance.get_flavor())
+        LOG.debug('privoder size: %s' % provider_size)
+        provider_node_name = self._generate_provider_node_name(instance)
+        LOG.debug('provider_node_name: %s' % provider_node_name)
+
+        user_data = self._generate_user_data(instance)
+
+        LOG.debug('Start to create node.')
         provider_bdms = None
-        data_bdm_list = []
-        source_provider_volumes=[]
-        bdm_list = block_device_info.get('block_device_mapping',[])
-        if len(bdm_list)>0:
+        provider_node = self._create_node(instance,
+                                          provider_node_name,
+                                          provider_image,
+                                          provider_size,
+                                          provider_bdms,
+                                          user_data)
+        LOG.debug('node: %s' % provider_node)
+        LOG.debug('-------------Start to create hyper service container.-------------')
+        self._create_hyper_service_container(context,
+                                             instance,
+                                             provider_node,
+                                             network_info,
+                                             block_device_info,
+                                             image_meta,
+                                             injected_files, admin_password)
+        LOG.debug('-------------SUCCESS to create hyper service container.---------------')
 
-            self._update_vm_task_state(
-                instance,
-                task_state=aws_task_states.CREATING_VOLUME)
-
-            root_volume_name = block_device_info.get('root_device_name',None)
-
-            # if data volume exist: more than one block device mapping
-            # import volume to aws
-            provider_volume_ids = []
-
-            for bdm in bdm_list:
-                # skip boot volume
-                if bdm.get('mount_device') == root_volume_name:
-                    continue
-                data_bdm_list.append(bdm)
-
-                connection_info = bdm.get('connection_info', None)
-                volume_id = connection_info['data']['volume_id']
-
-                provider_volume_id = self._get_provider_volume_id(context, volume_id)
-                # only if volume DO NOT exist in aws when import volume
-                if not provider_volume_id:
-                    provider_volume_id = self._import_volume_from_glance(
-                        context,
-                        volume_id,
-                        instance,
-                        CONF.provider_opts.availability_zone)
-
-                provider_volume_ids.append(provider_volume_id)
-
-            # create snapshot
-            provider_snapshots = []
-
-            if len(provider_volume_ids) > 0:
-                source_provider_volumes = self.compute_adapter.list_volumes(ex_volume_ids=provider_volume_ids)
-                for provider_volume in source_provider_volumes:
-                    provider_snapshots.append(
-                        self.compute_adapter.create_volume_snapshot(provider_volume))
-
-            provider_snapshot_ids = []
-            for snap in provider_snapshots:
-                provider_snapshot_ids.append(snap.id)
-
-            self._wait_for_snapshot_completed(provider_snapshot_ids)
-
-            # create provider bdm list from bdm_info and snapshot
-            provider_bdms = []
-            if len(provider_snapshots)>0:
-                for ii in range(0, len(data_bdm_list)):
-                    provider_bdm = {'DeviceName':
-                                        self._trans_device_name(data_bdm_list[ii].get('mount_device')),
-                                    'Ebs': {'SnapshotId':provider_snapshots[ii].id,
-                                            'DeleteOnTermination': data_bdm_list[ii].get('delete_on_termination')}
-                                    }
-                    provider_bdms.append(provider_bdm)
-
-            return provider_bdms, source_provider_volumes, data_bdm_list
+        # reset the original state
+        self._update_vm_task_state(instance, task_state=vm_task_state)
 
     def _create_hypervm_from_volume(self, context, instance, image_meta, injected_files,
                                         admin_password, network_info, block_device_info):
@@ -1103,6 +1231,10 @@ class AwsEc2Driver(driver.ComputeDriver):
         bdms = block_device_info.get('block_device_mapping',[])
         root_device_name = block_device_info.get('root_device_name', '')
         root_bdm = self._get_root_bdm_from_bdms(bdms, root_device_name)
+        if root_bdm is None:
+            error_info = 'boot bdm is None.'
+            LOG.error(error_info)
+            raise Exception(error_info)
         LOG.debug('root_bdm: %s' % root_bdm)
         image_metadata_of_root_volume = self._get_image_metadata_from_bdm(context, root_bdm)
         LOG.debug('get image metadata of root volume: %s' % image_metadata_of_root_volume)
@@ -1118,17 +1250,11 @@ class AwsEc2Driver(driver.ComputeDriver):
         LOG.debug('privoder size: %s' % provider_size)
         provider_node_name = self._generate_provider_node_name(instance)
         LOG.debug('provider_node_name: %s' % provider_node_name)
-        LOG.debug('Start to create provider bdms, it is to create snapshot for attaching data volumes.')
-        provider_bdms, source_provider_volumes, data_bdm_list = self._get_provider_bdm_info(context,
-                                               instance,
-                                               block_device_info)
-        LOG.debug('provider_bdms: %s' % provider_bdms)
-        LOG.debug('source_provider_volumes: %s' % source_provider_volumes)
-        LOG.debug('data_bdm_list: %s' % data_bdm_list)
 
         user_data = self._generate_user_data(instance)
 
         LOG.debug('Start to create node.')
+        provider_bdms = None
         provider_node = self._create_node(instance,
                                           provider_node_name,
                                           provider_image,
@@ -1137,31 +1263,14 @@ class AwsEc2Driver(driver.ComputeDriver):
                                           user_data)
         LOG.debug('node: %s' % provider_node)
         LOG.debug('-------------Start to create hyper service container.-------------')
-        LOG.debug('image_name: %s' % image_name)
         self._create_hyper_service_container(context,
                                              instance,
                                              provider_node,
                                              network_info,
                                              block_device_info,
-                                             image_name,
-                                             injected_files)
+                                             image_metadata_of_root_volume,
+                                             injected_files, admin_password)
         LOG.debug('-------------SUCCESS to create hyper service container.---------------')
-
-        LOG.debug('Start to map data volume id to provider')
-        # 6 mapp data volume id to provider
-        provider_bdm_list = provider_node.extra.get('block_device_mapping')
-        for ii in range(0, len(data_bdm_list)):
-            provider_volume_id = provider_bdm_list[ii+1].get('ebs').get('volume_id')
-            provider_volumes = self.compute_adapter.list_volumes(ex_volume_ids=[provider_volume_id])
-
-            connection_info = data_bdm_list[ii].get('connection_info',[])
-            volume_id = connection_info['data']['volume_id']
-
-            self._map_volume_to_provider(context, volume_id, provider_volumes[0])
-
-        #delete the  tmp volume
-        for provider_volume in source_provider_volumes:
-            self.compute_adapter.destroy_volume(provider_volume)
 
         #reset the original state
         self._update_vm_task_state(
@@ -1188,48 +1297,46 @@ class AwsEc2Driver(driver.ComputeDriver):
 
     def _create_hyper_service_container(self, context, instance, provider_node,
                                         network_info, block_device_info,
-                                        image_name, inject_file):
+                                        image_metadata, inject_file, admin_password):
         LOG.debug('Start to create hyper service container')
         instance.metadata['is_hybrid_vm'] = True
         instance.save()
+        image_name = self._get_image_name_from_meta(image_metadata)
+        image_uuid = self._get_image_id_from_meta(image_metadata)
         # update port bind host
-        LOG.debug('Start to binding host')
         self._binding_host(context, network_info, instance.uuid)
 
-        LOG.debug('Start to get location')
         size = instance.get_flavor().get('root_gb')
-        LOG.debug('data volume size: %s' % size)
-        provider_location = self.compute_adapter.get_location(self.location)
-        LOG.debug('provider_location: %s' % provider_location)
-        if not provider_location:
-            error_info = 'No provider_location, release resource and return'
-            raise ValueError(error_info)
-        LOG.debug('get location: %s' % provider_location)
+        provider_location = self._get_location()
 
-        LOG.info('start to create volume')
-        volume_name = provider_node.id
-        provider_hybrid_volume = self.compute_adapter.create_volume(size, volume_name, provider_location)
-        if not provider_hybrid_volume:
-            error_info = 'provider_hybrid_volume is None, release resource and return'
-            raise error_info
-        #self._wait_for_volume_available(provider_hybrid_volume)
-        LOG.info('end to create volume: %s' % provider_hybrid_volume)
+        root_volume = self._get_root_volume(context, block_device_info)
+        if not root_volume:
+            # if not exist hybrid root volume, then it is spawn from image.
+            provider_hybrid_volume = self._create_data_volume_for_container(provider_node, size, provider_location)
+            try:
+                self._wait_for_volume_is_available(provider_hybrid_volume)
+            except Exception, e:
+                LOG.error('exception: %s' % traceback.format_exc(e))
+                time.sleep(2)
+                self._deal_with_spawn_docker_app_failed(e.message, provider_hybrid_volume)
+        else:
+            # if exist hybrid root volume, it means spawn from volume, need to check if exist mapped root volume in aws.
+            # if not exist mapped root volume of aws, means it is first time spawn from root volume, then need to create
+            # mapped root volume in aws. if exist mapped root volume of aws, use it directly.
+            provider_hybrid_volume = self._get_provider_volume(root_volume.get('id'))
+            if not provider_hybrid_volume:
+                provider_hybrid_volume = self._create_data_volume_for_container(provider_node, size, provider_location)
+                try:
+                    self._wait_for_volume_is_available(provider_hybrid_volume)
+                except Exception, e:
+                    self._deal_with_spawn_docker_app_failed(e.message, provider_hybrid_volume)
+                self._map_volume_to_provider(context, root_volume.get('id'), provider_hybrid_volume)
 
-        # TODO: Exception process and wait volume available
-        time.sleep(10)
-        LOG.debug('Start to attach volume')
-        attache_result = self.compute_adapter.attach_volume(provider_node, provider_hybrid_volume, '/dev/sdz')
-        LOG.info('end to attache volume: %s' % attache_result)
-        # TODO wait for volume attached, need to judge volume state
-
-        # TODO: Exception process and wait attach sucess
-        time.sleep(10)
+        device = '/dev/sdz'
+        self._attache_volume_and_wait_for_attached(provider_node, provider_hybrid_volume, device)
 
         LOG.debug('Start to get clients.')
-        port = CONF.provider_opts.hybrid_service_port
-        private_ips = self._get_node_private_ips(provider_node)
-        LOG.debug('private ips: %s' % private_ips)
-        clients = self._get_hybrid_service_client(private_ips, port)
+        clients = self._get_hybrid_service_clients_by_node(provider_node)
 
         try:
             LOG.debug('wait for docker service starting')
@@ -1249,13 +1356,26 @@ class AwsEc2Driver(driver.ComputeDriver):
             LOG.error('inject file failed, exception: %s' % traceback.format_exc(e))
             self._deal_with_spawn_docker_app_failed(e.message, volume=provider_hybrid_volume)
 
+        LOG.debug('old block_device_info: %s' % block_device_info)
+        block_device_info = self._attache_volume_and_get_new_bdm(context, instance, block_device_info, provider_node)
+        LOG.debug('new block_device_info: %s' % block_device_info)
+
         try:
-            LOG.debug('Start to create container by using image: %s' % image_name)
-            created_container = self._hype_create_container(clients, image_name)
-            LOG.debug('created_container: %s' % created_container)
+            create_container_task = self._hyper_create_container_task(clients, image_name, image_uuid,
+                                                                      inject_file, admin_password, network_info,
+                                                                      block_device_info)
+            self._wait_for_task_finish(clients, create_container_task)
+
         except Exception, e:
             LOG.error('create container failed, exception: %s' % traceback.format_exc(e))
             self._deal_with_spawn_docker_app_failed(e.message)
+        # try:
+        #     LOG.debug('Start to create container by using image: %s' % image_name)
+        #     created_container = self._hype_create_container(clients, image_name)
+        #     LOG.debug('created_container: %s' % created_container)
+        # except Exception, e:
+        #     LOG.error('create container failed, exception: %s' % traceback.format_exc(e))
+        #     self._deal_with_spawn_docker_app_failed(e.message)
 
         try:
             LOG.info('network_info: %s' % network_info)
@@ -1269,30 +1389,95 @@ class AwsEc2Driver(driver.ComputeDriver):
             LOG.error('start container failed:%s' % traceback.format_exc(e))
             self._deal_with_spawn_docker_app_failed(e.message)
 
-        provider_volume_map, bdm_map = self._get_provider_volumes_map_from_bdm(context, instance, block_device_info)
-        LOG.debug('get provider volume map: %s' % provider_volume_map)
-        LOG.debug('get bdm_map: %s' % bdm_map)
-        if provider_volume_map:
-            for hybrid_volume_id, provider_volume in provider_volume_map.items():
-                if bdm_map.get(hybrid_volume_id):
-                    mount_point = bdm_map.get(hybrid_volume_id).get('mount_device')
-                    LOG.debug('mount_point: %s' % mount_point)
-                    self._attache_volume_for_docker_app(context, instance, hybrid_volume_id,
-                                                        mount_point,
-                                                        provider_node,
-                                                        provider_volume)
-                else:
-                    LOG.debug('can not get mount_device for hybrid_volume_id: %s' % hybrid_volume_id)
-
-        if inject_file:
-            try:
-                #self._hype_inject_file_to_container(clients, inject_file)
-                LOG.debug('inject file success.')
-            except Exception, e:
-                LOG.error('inject file to container failed. exception: %s' % exception)
-                self._deal_with_spawn_docker_app_failed(e.message)
+        # provider_volume_map, bdm_map = self._get_provider_volumes_map_from_bdm(context, instance, block_device_info)
+        # LOG.debug('get provider volume map: %s' % provider_volume_map)
+        # LOG.debug('get bdm_map: %s' % bdm_map)
+        # if provider_volume_map:
+        #     for hybrid_volume_id, provider_volume in provider_volume_map.items():
+        #         if bdm_map.get(hybrid_volume_id):
+        #             mount_point = bdm_map.get(hybrid_volume_id).get('mount_device')
+        #             LOG.debug('mount_point: %s' % mount_point)
+        #             self._attache_volume_for_docker_app(context, instance, hybrid_volume_id,
+        #                                                 mount_point,
+        #                                                 provider_node,
+        #                                                 provider_volume)
+        #         else:
+        #             LOG.debug('can not get mount_device for hybrid_volume_id: %s' % hybrid_volume_id)
+        #
+        # if inject_file:
+        #     try:
+        #         # self._hype_inject_file_to_container(clients, inject_file)
+        #         LOG.debug('inject file success.')
+        #     except Exception, e:
+        #         LOG.error('inject file to container failed. exception: %s' % exception)
+        #         self._deal_with_spawn_docker_app_failed(e.message)
 
         self._binding_host(context, network_info, instance.uuid)
+
+    def _attache_volume_and_wait_for_attached(self, provider_node, provider_hybrid_volume, device):
+        LOG.debug('Start to attach volume')
+        attache_result = self.compute_adapter.attach_volume(provider_node, provider_hybrid_volume, device)
+        self._wait_for_volume_is_attached(provider_hybrid_volume)
+        LOG.info('end to attache volume: %s' % attache_result)
+
+    def _get_location(self):
+        LOG.debug('Start to get location')
+        provider_location = self.compute_adapter.get_location(self.location)
+        LOG.debug('provider_location: %s' % provider_location)
+        if not provider_location:
+            error_info = 'No provider_location, release resource and return'
+            raise ValueError(error_info)
+        LOG.debug('get location: %s' % provider_location)
+
+        return provider_location
+
+    def _get_root_volume(self, context, block_device_info):
+        LOG.debug('start to get root volume for block_device_info: %s' % block_device_info)
+        bdms = block_device_info.get('block_device_mapping', [])
+        root_device_name = block_device_info.get('root_device_name', '')
+        if root_device_name:
+            root_bdm = self._get_root_bdm_from_bdms(bdms, root_device_name)
+            if root_bdm:
+                root_volume = self._get_volume_from_bdm(context, root_bdm)
+            else:
+                root_volume = None
+        else:
+            root_volume = None
+
+        LOG.debug('end to get root volume: %s' % root_volume)
+        return root_volume
+
+    def _get_root_volume_by_index_0(self, context, block_device_info):
+        LOG.debug('start to get root volume by index 0 for block_device_info: %s' % block_device_info)
+        bdms = block_device_info.get('block_device_mapping', [])
+        root_bdm = self._get_root_bdm_from_bdms_by_index_0(bdms)
+        if root_bdm:
+            root_volume = self._get_volume_from_bdm(context, root_bdm)
+        else:
+            root_volume = None
+
+        LOG.debug('end to get root volume: %s' % root_volume)
+        return root_volume
+
+    def _get_root_bdm_from_bdms_by_index_0(self, bdms):
+        root_bdm = None
+        for bdm in bdms:
+            if bdm['boot_index'] == 0:
+                root_bdm = bdm
+                break
+        return root_bdm
+
+    def _create_data_volume_for_container(self, provider_node, size, provider_location):
+        LOG.info('start to create volume')
+        volume_name = provider_node.id
+        provider_hybrid_volume = self.compute_adapter.create_volume(size, volume_name, provider_location)
+        if not provider_hybrid_volume:
+            error_info = 'provider_hybrid_volume is None, release resource and return'
+            raise error_info
+        #self._wait_for_volume_available(provider_hybrid_volume)
+        LOG.info('end to create volume: %s' % provider_hybrid_volume)
+
+        return provider_hybrid_volume
 
     def _create_node_ec2(self, context, instance, image_meta, injected_files,
                                         admin_password, network_info, block_device_info):
@@ -1336,8 +1521,8 @@ class AwsEc2Driver(driver.ComputeDriver):
         LOG.debug(_("network_info is: %s") % network_info)
         LOG.debug(_("block_device_info is: %s") % block_device_info)
         bdms = block_device_info.get('block_device_mapping', [])
-        if not instance.image_ref and len(bdms)>0:
-            image_container_type = instance.system_metadata.get('image_container_format')
+        image_container_type = instance.system_metadata.get('image_container_format')
+        if not instance.image_ref and len(bdms) > 0:
             LOG.debug('image_container_type: %s' % image_container_type)
             if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
                 self._spawn_from_volume_for_hybrid_vm(context, instance, image_meta, injected_files,
@@ -1356,11 +1541,9 @@ class AwsEc2Driver(driver.ComputeDriver):
                     provider_node = self._spawn_from_image(context, instance, image_meta, injected_files,
                                                            admin_password, network_info, block_device_info)
 
-
                     provider_bdm_list = provider_node.extra.get('block_device_mapping')
                     provider_root_volume_id = provider_bdm_list[0].get('ebs').get('volume_id')
-                    provider_root_volume = self.compute_adapter.list_volumes(
-                        ex_volume_ids=[provider_root_volume_id])[0]
+                    provider_root_volume = self.compute_adapter.list_volumes(ex_volume_ids=[provider_root_volume_id])[0]
                     self._map_volume_to_provider(context, root_volume_id, provider_root_volume)
 
                 elif len(provider_volumes) == 0:
@@ -1372,7 +1555,11 @@ class AwsEc2Driver(driver.ComputeDriver):
                     raise exception_ex.MultiVolumeConfusion
         else:
             # if boot from image: (import image in provider cloud, then boot instance)
-            self._spawn_from_image(context, instance, image_meta, injected_files,
+            if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
+                self._create_hypervm_from_image(context, instance, image_meta, injected_files,
+                                                           admin_password, network_info, block_device_info)
+            else:
+                self._spawn_from_image(context, instance, image_meta, injected_files,
                                     admin_password, network_info, block_device_info)
         LOG.debug("creating instance %s success!" % instance.uuid)
 
@@ -1393,25 +1580,24 @@ class AwsEc2Driver(driver.ComputeDriver):
     def _get_provider_image_id(self, image_obj):
         try:
             image_uuid = self._get_image_id_from_meta(image_obj)
-            provider_image = self.compute_adapter.list_images(
-                ex_filters={'tag:hybrid_cloud_image_id':image_uuid})
+            provider_image = self.compute_adapter.list_images(ex_filters={'tag:hybrid_cloud_image_id': image_uuid})
             if provider_image is None:
                 raise exception_ex.ProviderRequestTimeOut
 
-            if len(provider_image)==0:
+            if len(provider_image) == 0:
                 # raise exception.ImageNotFound
                 LOG.warning('Image %s NOT Found at provider cloud' % image_uuid)
                 return None
-            elif len(provider_image)>1:
+            elif len(provider_image) > 1:
                 raise exception_ex.MultiImageConfusion
             else:
                 return provider_image[0].id
         except Exception as e:
             LOG.error('Can NOT get image %s from provider cloud tag' % image_uuid)
             LOG.error(e.message)
-            return  None
+            return None
 
-    def _get_provider_image(self,image_obj):
+    def _get_provider_image(self, image_obj):
 
         try:
             image_uuid = self._get_image_id_from_meta(image_obj)
@@ -1431,6 +1617,23 @@ class AwsEc2Driver(driver.ComputeDriver):
         except Exception as e:
             LOG.error('get provider image failed: %s' % e.message)
             return None
+
+    def _get_provider_image_by_provider_id(self, image_id):
+        provider_image = None
+        provider_images = self.compute_adapter.list_images(ex_image_ids=[image_id])
+        if provider_images:
+            if len(provider_images) == 1:
+                provider_image = provider_images[0]
+            elif len(provider_image) > 1:
+                error_info = 'More then one image are found for id: %s' % image_id
+                LOG.error(error_info)
+                raise exception_ex.MultiImageConfusion
+            else:
+                provider_image = None
+        else:
+            provider_image = None
+
+        return provider_image
 
     @RetryDecorator(max_retry_count=3,inc_sleep_time=1,max_sleep_time=60,
                         exceptions=(Exception))
@@ -1720,7 +1923,7 @@ class AwsEc2Driver(driver.ComputeDriver):
         image_container_type = instance.system_metadata.get('image_container_format')
         LOG.debug('image_container_type: %s' % image_container_type)
         # if is hybrid_vm, need to attache volume for docker app(container).
-        if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
+        if image_container_type == CONTAINER_FORMAT_HYBRID_VM and provider_node.state == NodeState.RUNNING:
             self._attache_volume_for_docker_app(context,
                                                 instance,
                                                 volume_id,
@@ -1730,10 +1933,6 @@ class AwsEc2Driver(driver.ComputeDriver):
         else:
             self.compute_adapter.attach_volume(provider_node, provider_volume,
                                                self._trans_device_name(mountpoint))
-
-    def _attach_volume_for_hyper_vm(self):
-        #TODO
-        pass
 
     def _get_volume_devices_list_for_docker_app(self, instance, clients):
         """
@@ -1758,24 +1957,18 @@ class AwsEc2Driver(driver.ComputeDriver):
 
     def _attache_volume_for_docker_app(self, context, instance, volume_id, mountpoint, provider_node, provider_volume):
         LOG.debug('start attach volume for docker app')
-        port = CONF.provider_opts.hybrid_service_port
-        LOG.debug('port: %s' % port)
-        private_ips = self._get_node_private_ips(provider_node)
-        LOG.debug('private_ips %s' % private_ips)
-        clients = self._get_hybrid_service_client(private_ips, port)
+        clients = self._get_hybrid_service_clients_by_node(provider_node)
         old_volumes_list = self._get_volume_devices_list_for_docker_app(instance, clients)
         LOG.debug('old_volumes_list: %s' % old_volumes_list)
 
-        LOG.debug('attach provider volume')
-        self.compute_adapter.attach_volume(provider_node, provider_volume,
-                                           self._trans_device_name(mountpoint))
-        LOG.debug('end to attach volume')
+        self._attache_volume_and_wait_for_attached(provider_node, provider_volume, self._trans_device_name(mountpoint))
 
         try:
             is_docker_service_up = self._clients_wait_hybrid_service_up(clients)
         except Exception, e:
             LOG.error('docker is not start, exception: %s' % traceback.format_exc(e))
             raise e
+        LOG.debug('start to get added device')
         added_device = self._get_added_device(instance, clients, old_volumes_list)
         if is_docker_service_up:
             try:
@@ -1786,8 +1979,47 @@ class AwsEc2Driver(driver.ComputeDriver):
                 LOG.error(error_info)
                 raise exception.NovaException(error_info)
 
+    def _attache_volume_and_get_new_bdm(self, context, instance, block_device_info, provider_node):
+        bdm_list = block_device_info.get('block_device_mapping')
+        for bdm in bdm_list:
+            hybrid_cloud_volume_id = bdm.get('connection_info').get('data').get('volume_id')
+            provider_volume_id = self._get_provider_volume_id(context, hybrid_cloud_volume_id)
+            # if volume doesn't exist in aws, it need to import volume from image
+            if not provider_volume_id:
+                LOG.debug('provider volume is not exist for volume: %s' % hybrid_cloud_volume_id)
+                provider_volume_id = self._import_volume_from_glance(context,
+                                                                     hybrid_cloud_volume_id,
+                                                                     instance,
+                                                                     CONF.provider_opts.availability_zone)
+                created_provider_volume = self._get_provider_volume_by_provider_volume_id(provider_volume_id)
+                self._map_volume_to_provider(context, hybrid_cloud_volume_id, created_provider_volume)
+                provider_volume = self._get_provider_volume(hybrid_cloud_volume_id)
+            else:
+                provider_volume = self._get_provider_volume(hybrid_cloud_volume_id)
+            mount_device = bdm.get('mount_device')
+            clients = self._get_hybrid_service_clients_by_node(provider_node)
+            old_volumes_list = self._get_volume_devices_list_for_docker_app(instance, clients)
+            LOG.debug('old_volumes_list: %s' % old_volumes_list)
+
+            self._attache_volume_and_wait_for_attached(provider_node, provider_volume, self._trans_device_name(mount_device))
+
+            try:
+                is_docker_service_up = self._clients_wait_hybrid_service_up(clients)
+            except Exception, e:
+                LOG.error('docker is not start, exception: %s' % traceback.format_exc(e))
+                raise e
+            added_device = self._get_added_device(instance, clients, old_volumes_list)
+            bdm['real_device'] = added_device
+
+            hybrid_volume = self._get_volume_from_bdm(context, bdm)
+            bdm['size'] = hybrid_volume.get('size')
+
+        return block_device_info
+
+
     @RetryDecorator(max_retry_count=60, inc_sleep_time=2, max_sleep_time=60, exceptions=(Exception))
     def _get_added_device(self, instance, clients, old_volumes_list):
+        LOG.debug('start to get added device')
         added_device = None
         new_volumes_list = self._get_volume_devices_list_for_docker_app(instance, clients)
         LOG.debug('new_volumes_list: %s' % new_volumes_list)
@@ -1800,6 +2032,7 @@ class AwsEc2Driver(driver.ComputeDriver):
         else:
             added_device = added_device_list[0]
 
+        LOG.debug('end to get added device: %s' % added_device)
         return added_device
 
 
@@ -1827,7 +2060,7 @@ class AwsEc2Driver(driver.ComputeDriver):
                 provider_volumes = self.compute_adapter.list_volumes(ex_filters={'tag:hybrid_cloud_volume_id':volume_id})
                 if len(provider_volumes) == 1:
                     provider_volume_id = provider_volumes[0].id
-                    self.cinder_api.update_volume_metadata(context,volume_id,{'provider_volume_id':provider_volume_id})
+                    self.cinder_api.update_volume_metadata(context, volume_id, {'provider_volume_id':provider_volume_id})
                 elif len(provider_volumes)>1:
                     LOG.warning('More than one instance are found through tag:hybrid_cloud_volume_id %s' % volume_id)
 
@@ -1899,9 +2132,7 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         if instance.system_metadata.get('image_container_format') == CONTAINER_FORMAT_HYBRID_VM \
                 and self._node_is_active(node):
-            private_ips = self._get_node_private_ips(node)
-            port = CONF.provider_opts.hybrid_service_port
-            clients = self._get_hybrid_service_client(private_ips, port)
+            clients = self._get_hybrid_service_clients_by_node(node)
             self._clients_detach_interface(clients, vif)
 
     def detach_volume(self, connection_info, instance, mountpoint,
@@ -1933,9 +2164,7 @@ class AwsEc2Driver(driver.ComputeDriver):
         image_container_type = instance.system_metadata.get('image_container_format')
         LOG.debug('image_container_type: %s' % image_container_type)
         if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
-            port = CONF.provider_opts.hybrid_service_port
-            private_ips = self._get_node_private_ips(provider_node)
-            clients = self._get_hybrid_service_client(private_ips, port)
+            clients = self._get_hybrid_service_clients_by_node(provider_node)
             self._detach_volume_for_docker_app(clients, volume_id)
 
         # 2.dettach
@@ -1998,9 +2227,7 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         if instance.system_metadata.get('image_container_format') == CONTAINER_FORMAT_HYBRID_VM \
                 and self._node_is_active(node):
-            private_ips = self._get_node_private_ips(node)
-            port = CONF.provider_opts.hybrid_service_port
-            clients = self._get_hybrid_service_client(private_ips, port)
+            clients = self._get_hybrid_service_clients_by_node(node)
             self._clients_attach_interface(clients, vif)
         self._binding_host_vif(vif, instance.uuid)
 
@@ -2046,23 +2273,24 @@ class AwsEc2Driver(driver.ComputeDriver):
     def destroy(self, context, instance, network_info, block_device_info=None,
                 destroy_disks=True, migrate_data=None):
         """Destroy VM instance."""
-        LOG.debug('begin destory node %s',instance.uuid)
+        LOG.debug('begin destroy node %s',instance.uuid)
+        LOG.debug('destroy_disks: %s' % destroy_disks)
         try:
-            task_list =instance_task_map[instance.uuid]
+            task_list = instance_task_map[instance.uuid]
             if task_list:
                 for task in task_list:
-                    LOG.debug('the task of instacne %s is %s' %(instance.uuid, task.task_id))
+                    LOG.debug('the task of instance %s is %s' %(instance.uuid, task.task_id))
                     task = self.compute_adapter.get_task_info(task)
                     if not task.is_completed():
                         task._cancel_task()
             instance_task_map.pop(instance.uuid)
         except KeyError:
-            LOG.debug('the instance %s dont have task', instance.uuid)
+            LOG.debug('the instance %s does not have task', instance.uuid)
 
         node = self._get_provider_node(instance)
         if node is None:
             LOG.error('get instance %s error at provider cloud' % instance.uuid)
-            reason = "Error geting instance."
+            reason = "Error getting instance."
             raise exception.InstanceTerminationFailure(reason=reason)
         if not node:
             LOG.error('instance %s not exist at provider cloud' % instance.uuid)
@@ -2087,48 +2315,50 @@ class AwsEc2Driver(driver.ComputeDriver):
                 else:
                     provider_volume_ids.append(self._get_provider_volume_id(context, volume_id))
 
-        # 1. dettach volumes, if needed
-        if not destroy_disks:
-                # get volume in provide cloud
-                provider_volumes = self.compute_adapter.list_volumes(ex_volume_ids=provider_volume_ids)
-
-                # detach
-                for provider_volume in provider_volumes:
-                    self.compute_adapter.detach_volume(provider_volume)
-                for local_volume in local_volume_ids:
-                    volume = self.cinder_api.get(context, local_volume)
-                    attachment = self.cinder_api.get_volume_attachment(volume, instance['uuid'])
-                    if attachment:
-                        self.cinder_api.detach(context, local_volume, attachment['attachment_id'])
+        # # 1. dettach volumes, if needed
+        # if not destroy_disks:
+        #         # get volume in provide cloud
+        #         provider_volumes = self.compute_adapter.list_volumes(ex_volume_ids=provider_volume_ids)
+        #
+        #         # detach
+        #         for provider_volume in provider_volumes:
+        #             self.compute_adapter.detach_volume(provider_volume)
+        #         for local_volume in local_volume_ids:
+        #             volume = self.cinder_api.get(context, local_volume)
+        #             attachment = self.cinder_api.get_volume_attachment(volume, instance['uuid'])
+        #             if attachment:
+        #                 self.cinder_api.detach(context, local_volume, attachment['attachment_id'])
 
         image_container_type = instance.system_metadata.get('image_container_format')
         LOG.debug('image_container_type: %s' % image_container_type)
         # if is hybrid_vm, need to stop docker app(container) first, then stop node.
+
         if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
-            LOG.debug('image type of instance is hybridvm, need to remove data volume of container.')
+            root_volume = self._get_root_volume_by_index_0(context, block_device_info)
+            # if not exist root volume, means it is boot from image, need to remote data volume of container.
+            # if exist root volume, the data volume is a root volume. How to delete it will decided by manager.
+            if not root_volume:
+                LOG.debug('image type of instance is hybridvm, need to remove data volume of container.')
 
-            provider_volume_name_for_hybrid_vm_container = node.id
-            hybrid_container_volume = self._get_provider_container_data_volume(provider_vol_list,
-                                                         provider_volume_name_for_hybrid_vm_container)
-            if node.state != NodeState.TERMINATED:
-                self._stop_node(node)
-            if hybrid_container_volume:
-                self._detach_volume(hybrid_container_volume)
-                self._delete_volume(hybrid_container_volume)
-            else:
-                LOG.warning('There is no container data volume, pass to'
-                            ' detach volume and delete volume for node: %s' % node.id)
+                provider_volume_name_for_hybrid_vm_container = node.id
+                hybrid_container_volume = self._get_provider_container_data_volume(provider_vol_list,
+                                                             provider_volume_name_for_hybrid_vm_container)
+                if node.state != NodeState.STOPPED and node.state != NodeState.TERMINATED:
+                    self._stop_node(node)
+                if hybrid_container_volume:
+                    self._detach_volume(hybrid_container_volume)
+                    self._delete_volume(hybrid_container_volume)
+                else:
+                    LOG.warning('There is no container data volume, pass to'
+                                ' detach volume and delete volume for node: %s' % node.id)
+            # no matter it is boot from volume or image, both need to remove neutron agent.
             self._remove_neutron_agent(instance)
-        else:
-            # 2.destory node
-            # self.compute_adapter.destroy_node(node)
-            try:
-                if node.state != NodeState.TERMINATED:
-                    self.compute_adapter.destroy_node(node)
-            except Exception as e:
-                LOG.warning('Failed to delete provider nodes. %s', e.message)
 
-            while node.state!=NodeState.TERMINATED:
+        # 2.destroy node
+        if node.state != NodeState.TERMINATED:
+            self.compute_adapter.destroy_node(node)
+
+            while node.state != NodeState.TERMINATED:
                 time.sleep(5)
                 nodes = self.compute_adapter.list_nodes(ex_node_ids=[node.id])
                 if not nodes:
@@ -2145,12 +2375,12 @@ class AwsEc2Driver(driver.ComputeDriver):
                 LOG.warning('Failed to delete network interface %s', eth.id)
 
         # 3.2 delete volumes, if needed
-        if destroy_disks:
-            for vol in provider_vol_list:
-                try:
-                    self.compute_adapter.destroy_volume(vol)
-                except:
-                    LOG.warning('Failed to delete provider vol %s', vol.id)
+        # if destroy_disks:
+        #     for vol in provider_vol_list:
+        #         try:
+        #             self.compute_adapter.destroy_volume(vol)
+        #         except:
+        #             LOG.warning('Failed to delete provider vol %s', vol.id)
 
         # todo: unset volume mapping
         bdms = block_device_info.get('block_device_mapping',[])
@@ -2268,7 +2498,7 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         return provider_node_id
 
-    def _get_provider_node(self,instance_obj):
+    def _get_provider_node(self, instance_obj):
         """map openstack instance to ec2 instance """
 
         provider_node_id = instance_obj.metadata.get('provider_node_id')
@@ -2329,9 +2559,7 @@ class AwsEc2Driver(driver.ComputeDriver):
 
     def _stop_container_in_loop(self, node):
         is_stop = False
-        port = CONF.provider_opts.hybrid_service_port
-        private_ips = self._get_node_private_ips(node)
-        clients = self._get_hybrid_service_client(private_ips, port)
+        clients = self._get_hybrid_service_clients_by_node(node)
         try:
             is_stop = self._clients_stop_container(clients)
         except Exception as e:
@@ -2359,9 +2587,7 @@ class AwsEc2Driver(driver.ComputeDriver):
             LOG.debug('End to start container.')
 
     def _start_container_in_loop_clients(self, node, network_info, block_device_info):
-        port = CONF.provider_opts.hybrid_service_port
-        private_ips = self._get_node_private_ips(node)
-        clients = self._get_hybrid_service_client(private_ips, port)
+        clients = self._get_hybrid_service_clients_by_node(node)
         is_docker_service_up = False
         try:
             is_docker_service_up = self._clients_wait_hybrid_service_up(clients)
@@ -2421,9 +2647,7 @@ class AwsEc2Driver(driver.ComputeDriver):
         LOG.debug('image_container_type: %s' % image_container_type)
 
         if image_container_type == CONTAINER_FORMAT_HYBRID_VM:
-            port = CONF.provider_opts.hybrid_service_port
-            private_ips = self._get_node_private_ips(provider_node)
-            clients = self._get_hybrid_service_client(private_ips, port)
+            clients = self._get_hybrid_service_clients_by_node(provider_node)
 
             try:
                 is_docker_service_up = self._clients_wait_hybrid_service_up(clients)
@@ -2451,7 +2675,7 @@ class AwsEc2Driver(driver.ComputeDriver):
     def _wait_hybrid_service_up(self, client):
             return client.get_version()
 
-    @RetryDecorator(max_retry_count= 20,inc_sleep_time=5,max_sleep_time=60,
+    @RetryDecorator(max_retry_count=20,inc_sleep_time=5,max_sleep_time=60,
                         exceptions=(errors.APIError,errors.NotFound,
                                     errors.ConnectionError, errors.InternalError, Exception))
     def _hypervm_inject_file(self, client, file_data):
@@ -2459,15 +2683,6 @@ class AwsEc2Driver(driver.ComputeDriver):
         inject_reslut = client.inject_file(CONF.provider_opts.dst_path, file_data=file_data)
         LOG.info('end to inject file....')
         return inject_reslut
-
-    @RetryDecorator(max_retry_count= MAX_RETRY_COUNT,inc_sleep_time=5,max_sleep_time=60,
-                        exceptions=(errors.APIError,errors.NotFound,
-                                    errors.ConnectionError, errors.InternalError, Exception))
-    def _create_container(self, client, name):
-        LOG.info('start to create container')
-        created_container = client.create_container(name)
-        LOG.info('end to create container, created_container: %s' % created_container)
-        return created_container
 
     @RetryDecorator(max_retry_count= 100,inc_sleep_time=5,max_sleep_time=120,
                         exceptions=(errors.APIError,errors.NotFound,
@@ -2481,13 +2696,15 @@ class AwsEc2Driver(driver.ComputeDriver):
     def _hype_create_container(self, clients, name):
         LOG.info('start to create container')
         created_container = None
-        tmp_except = None
+        tmp_except = Exception('client is None')
         for client in clients:
             try:
                 created_container = client.create_container(name)
                 break
             except Exception, e:
                 tmp_except = e
+                LOG.error('exception when create container, exception: %s' % traceback.format_exc(e))
+                time.sleep(1)
                 continue
         if not created_container:
             raise tmp_except
@@ -2495,6 +2712,76 @@ class AwsEc2Driver(driver.ComputeDriver):
         LOG.info('end to create container, created_container: %s' % created_container)
         return created_container
 
+
+    @RetryDecorator(max_retry_count=MAX_RETRY_COUNT, inc_sleep_time=5, max_sleep_time=60, exceptions=(
+    errors.APIError, errors.NotFound, errors.ConnectionError, errors.InternalError, Exception))
+    def _hyper_create_container_task(self, clients, image_name, image_uuid, injected_files, admin_password,
+                                     network_info, block_device_info):
+        LOG.info('start to submit task for creating container.')
+        LOG.debug('admin_password: %s' % admin_password)
+        LOG.debug('injected_files: %s' % injected_files)
+        created_task = None
+        tmp_exception = Exception('empty for creating container')
+        for client in clients:
+            try:
+                created_task = client.create_container(image_name, image_uuid, inject_files=injected_files, admin_password=admin_password,
+                                network_info=network_info, block_device_info=block_device_info)
+            except Exception, e:
+                tmp_exception = e
+                LOG.error('exception when create container, exception: %s' % traceback.format_exc(e))
+                continue
+        if not created_task:
+            raise tmp_exception
+
+        LOG.info('end to submit task for creating container, task: %s' % created_task)
+
+        return created_task
+
+    @RetryDecorator(max_retry_count=50, inc_sleep_time=5, max_sleep_time=60,
+                    exceptions=(exception_ex.RetryException))
+    def _wait_for_task_finish(self, clients, task):
+        task_finish = False
+        if task['code'] == wormhole_constants.TASK_SUCCESS:
+            return True
+        current_task = self._hyper_query_task(clients, task)
+        task_code = current_task['code']
+
+        if wormhole_constants.TASK_DOING == task_code:
+            LOG.debug('task is DOING, status: %s' % task_code)
+            raise exception_ex.RetryException(error_info='task status is: %s' % task_code)
+        elif wormhole_constants.TASK_ERROR == task_code:
+            LOG.debug('task is ERROR, status: %s' % task_code)
+            raise Exception('task error, task status is: %s' % task_code)
+        elif wormhole_constants.TASK_SUCCESS == task_code:
+            LOG.debug('task is SUCCESS, status: %s' % task_code)
+            task_finish = True
+        else:
+            raise Exception('UNKNOW ERROR, task status: %s' % task_code)
+
+        LOG.debug('task: %s is finished' % task )
+
+        return task_finish
+
+
+
+    @RetryDecorator(max_retry_count=MAX_RETRY_COUNT, inc_sleep_time=5, max_sleep_time=60, exceptions=(
+    errors.APIError, errors.NotFound, errors.ConnectionError, errors.InternalError, Exception))
+    def _hyper_query_task(self, clients, task):
+        LOG.debug('star to query task.')
+        current_task = None
+        tmp_exception = 'empty for query task'
+        for client in clients:
+            try:
+                current_task = client.query_task(task)
+                break
+            except Exception, e:
+                tmp_exception = e
+                LOG.error('exception when query task. exception: %s' % traceback.format_exc(e))
+                continue
+        if not current_task:
+            raise tmp_exception
+
+        return current_task
 
     @RetryDecorator(max_retry_count= MAX_RETRY_COUNT,inc_sleep_time=5,max_sleep_time=60,
                         exceptions=(errors.APIError,errors.NotFound,
@@ -2531,7 +2818,7 @@ class AwsEc2Driver(driver.ComputeDriver):
         tmp_except = None
         for client in clients:
             try:
-                inject_result = client
+                inject_result = client.inject_files(inject_file)
                 break
             except Exception, e:
                 tmp_except = e
@@ -2585,6 +2872,28 @@ class AwsEc2Driver(driver.ComputeDriver):
         LOG.debug('end to get node private ips, private_ips: %s' % private_ips)
 
         return private_ips
+
+    def _get_hybrid_service_clients_by_instance(self, instance):
+        LOG.debug('start to get hybrid service clients.')
+        provider_node = self._get_provider_node(instance)
+        if not provider_node:
+            error_info = 'get instance %s error at provider cloud' % instance.uuid
+            LOG.error(error_info)
+            raise Exception(error_info)
+        clients = self._get_hybrid_service_clients_by_node(provider_node)
+
+        LOG.debug('end to get hybrid service clients')
+        return clients
+
+    def _get_hybrid_service_clients_by_node(self, provider_node):
+        port = CONF.provider_opts.hybrid_service_port
+        private_ips = self._get_node_private_ips(provider_node)
+        LOG.debug('port: %s' % port)
+        LOG.debug('private ips: %s' % private_ips)
+
+        clients = self._get_hybrid_service_client(private_ips, port)
+
+        return clients
 
     def _get_hybrid_service_client(self, ips, port):
         clients = []
@@ -2690,6 +2999,51 @@ class AwsEc2Driver(driver.ComputeDriver):
 
     @RetryDecorator(max_retry_count=50,inc_sleep_time=5,max_sleep_time=60,
                         exceptions=(errors.APIError,errors.NotFound, errors.ConnectionError, errors.InternalError))
+    def _clients_create_image_task(self, clients, image):
+        image_name = image['name']
+        LOG.debug('image name : %s' % image_name)
+        image_id = image['id']
+        LOG.debug('image id: %s' % image_id)
+
+        create_image_task = None
+        tmp_exception = Exception('tmp exception in create image task')
+        for client in clients:
+            try:
+                create_image_task = client.create_image(image_name, image_id)
+                LOG.debug('create image task: %s' % create_image_task)
+                break
+            except Exception, e:
+                tmp_exception = e
+                continue
+        if not create_image_task:
+            raise tmp_exception
+
+        return create_image_task
+
+    @RetryDecorator(max_retry_count=50, inc_sleep_time=5, max_sleep_time=60,
+                    exceptions=(errors.APIError, errors.NotFound, errors.ConnectionError, errors.InternalError))
+    def _clients_get_image_info(self, clients, image):
+        image_name = image['name']
+        image_id = image['id']
+
+        image_info = None
+        tmp_exception = Exception('tmp exception in get image_info')
+        for client in clients:
+            try:
+                image_info = client.image_info(image_name, image_id)
+                LOG.debug('get image_info: %s' % image_info)
+                break
+            except Exception, e:
+                tmp_exception = e
+                continue
+        if not image_info:
+            raise tmp_exception
+
+        return image_info
+
+
+    @RetryDecorator(max_retry_count=50,inc_sleep_time=5,max_sleep_time=60,
+                        exceptions=(errors.APIError,errors.NotFound, errors.ConnectionError, errors.InternalError))
     def _clients_list_volume_devices_for_docker_app(self, clients):
         volume_devices = None
         tmp_except = Exception('list volumes devices failed.')
@@ -2767,6 +3121,90 @@ class AwsEc2Driver(driver.ComputeDriver):
             raise tmp_except
 
         return attached
+
+    @RetryDecorator(max_retry_count=50,inc_sleep_time=5,max_sleep_time=60,
+                        exceptions=(errors.APIError,errors.NotFound, errors.ConnectionError, errors.InternalError))
+    def _clients_pause_container(self, clients):
+        paused = False
+        tmp_except = Exception('pause container failed.')
+        for client in clients:
+            try:
+                client.pause_container()
+                LOG.debug('pause container success.')
+                paused = True
+                break
+            except Exception, e:
+                tmp_except = e
+                continue
+
+        if not paused:
+            raise tmp_except
+
+        return paused
+
+    @RetryDecorator(max_retry_count=50,inc_sleep_time=5,max_sleep_time=60,
+                        exceptions=(errors.APIError,errors.NotFound, errors.ConnectionError, errors.InternalError))
+    def _clients_unpause_container(self, clients):
+        unpaused = False
+        tmp_except = Exception('unpause container failed.')
+        for client in clients:
+            try:
+                client.unpause_container()
+                LOG.debug('unpause container success.')
+                unpaused = True
+                break
+            except Exception, e:
+                tmp_except = e
+                continue
+
+        if not unpaused:
+            raise tmp_except
+
+        return unpaused
+
+    def pause(self, instance):
+        """Pause the specified instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
+        LOG.debug('start to pause instance: %s' % instance)
+
+        node = self._get_provider_node(instance)
+        LOG.debug("Node is: %s" % node)
+
+        if instance.system_metadata.get('image_container_format') == CONTAINER_FORMAT_HYBRID_VM \
+                and self._node_is_active(node):
+            clients = self._get_hybrid_service_clients_by_node(node)
+
+            is_docker_service_up = False
+            try:
+                is_docker_service_up = self._clients_wait_hybrid_service_up(clients)
+            except Exception, e:
+                LOG.error('docker is not start, exception: %s' % traceback.format_exc(e))
+            if is_docker_service_up:
+                self._clients_pause_container(clients)
+        LOG.debug('end to pause instance success.')
+
+    def unpause(self, instance):
+        """Unpause paused VM instance.
+
+        :param instance: nova.objects.instance.Instance
+        """
+        LOG.debug('start to unpause instance: %s' % instance)
+        node = self._get_provider_node(instance)
+
+        if instance.system_metadata.get('image_container_format') == CONTAINER_FORMAT_HYBRID_VM \
+                and self._node_is_active(node):
+            clients = self._get_hybrid_service_clients_by_node(node)
+
+            is_docker_service_up = False
+            try:
+                is_docker_service_up = self._clients_wait_hybrid_service_up(clients)
+            except Exception, e:
+                LOG.error('docker is not start, exception: %s' % traceback.format_exc(e))
+            if is_docker_service_up:
+                self._clients_unpause_container(clients)
+        LOG.debug('end to unpause instance success.')
 
 def qemu_img_info(path):
     """Return an object containing the parsed output from qemu-img info."""
