@@ -35,9 +35,6 @@ import adapter
 import exception_ex
 from nova.virt.aws import image_utils
 
-from jacketstatuscache.awssynchronizer import HCAWSS
-from jacketstatuscache.jacketcache import JacketStatusCache
-
 
 hybrid_cloud_opts = [
 
@@ -295,11 +292,6 @@ class AwsEc2Driver(driver.ComputeDriver):
             else:
                 self.provider_security_group_id = CONF.provider_opts.security_group
 
-        hcawss = HCAWSS(CONF.provider_opts.access_key_id,
-                        secret=CONF.provider_opts.secret_key,
-                        region=CONF.provider_opts.region, secure=False)
-        self.cache = JacketStatusCache(hcawss)
-
     def _get_auth(self, key_data, key_name):
         return None
 
@@ -320,8 +312,9 @@ class AwsEc2Driver(driver.ComputeDriver):
             LOG.error('list nodes failed, Nodes are null!')
             return instances
         for node in nodes:
-            instance_uuid = node.extra.get('tags').get('hybrid_cloud_instance_id')
-            instances.append(instance_uuid)
+            if node.state != NodeState.TERMINATED:
+                instance_uuid = node.extra.get('tags').get('hybrid_cloud_instance_id')
+                instances.append(instance_uuid)
 
         return instances
 
@@ -1158,6 +1151,7 @@ class AwsEc2Driver(driver.ComputeDriver):
             if not provider_nodes:
                 error_info = 'There is no node created in provider. node id: %s' % provider_node.id
                 LOG.error(error_info)
+                time.sleep(10)
                 continue
             else:
                 provider_node = provider_nodes[0]
@@ -2198,12 +2192,12 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         """
         # xxx(wangfeng):
-        return {'vcpus': 10000,
-                'memory_mb': 100000000,
-                'local_gb': 100000000,
+        return {'vcpus': 32,
+                'memory_mb': 164403,
+                'local_gb': 5585,
                 'vcpus_used': 0,
-                'memory_mb_used': 1000,
-                'local_gb_used': 1000,
+                'memory_mb_used': 69005,
+                'local_gb_used': 3479,
                 'hypervisor_type': 'aws',
                 'hypervisor_version': 5005000,
                 'hypervisor_hostname': nodename,
@@ -2258,17 +2252,9 @@ class AwsEc2Driver(driver.ComputeDriver):
     def get_info(self, instance):
         LOG.debug('begin get the instance %s info ' % instance.uuid)
         state = power_state.NOSTATE
-	provider_node_id = None
+
         # xxx(wangfeng): it is too slow to connect to aws to get info. so I delete it
 
-        provider_node_id = self._get_provider_node_id(instance)
-
-	if provider_node_id:
-            state = self.cache.query_status(provider_node_id)
-        if state:
-            LOG.debug('end get the instance %s info ,provider node is %s ' % (instance.uuid, provider_node_id))
-
-        '''
         node = self._get_provider_node(instance)
         if node:
             LOG.debug('end get the instance %s info ,provider node is %s ' % (instance.uuid,node.id))
@@ -2277,7 +2263,6 @@ class AwsEc2Driver(driver.ComputeDriver):
                 state = AWS_POWER_STATE[node_status]
             except KeyError:
                 state = power_state.NOSTATE
-        '''
 
         return {'state': state,
                 'max_mem': 0,
@@ -2809,8 +2794,6 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         return task_finish
 
-
-
     @RetryDecorator(max_retry_count=MAX_RETRY_COUNT, inc_sleep_time=5, max_sleep_time=60, exceptions=(
     errors.APIError, errors.NotFound, errors.ConnectionError, errors.InternalError, Exception))
     def _hyper_query_task(self, clients, task):
@@ -2949,7 +2932,7 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         return clients
 
-    @RetryDecorator(max_retry_count=50, inc_sleep_time=5,max_sleep_time=60,
+    @RetryDecorator(max_retry_count=100, inc_sleep_time=5,max_sleep_time=60,
                         exceptions=(errors.APIError, errors.NotFound, errors.ConnectionError, errors.InternalError))
     def _clients_wait_hybrid_service_up(self, clients):
         is_docker_up = False
@@ -3209,6 +3192,25 @@ class AwsEc2Driver(driver.ComputeDriver):
 
         return unpaused
 
+    @RetryDecorator(max_retry_count=50,inc_sleep_time=5,max_sleep_time=60,
+                        exceptions=(errors.APIError,errors.NotFound, errors.ConnectionError, errors.InternalError))
+    def _clients_get_console_output(self, clients):
+        result_output = None
+        tmp_except = Exception('get console_output failed.')
+        for client in clients:
+            try:
+                result_output = client.get_console_output()
+                LOG.debug('get console_output success.')
+                break
+            except Exception, e:
+                tmp_except = e
+                continue
+
+        if not result_output:
+            raise tmp_except
+
+        return result_output
+
     def pause(self, instance):
         """Pause the specified instance.
 
@@ -3252,6 +3254,31 @@ class AwsEc2Driver(driver.ComputeDriver):
             if is_docker_service_up:
                 self._clients_unpause_container(clients)
         LOG.debug('end to unpause instance success.')
+
+    def get_console_pool_info(self, console_type):
+        LOG.debug("get_console_pool_info")
+
+    def get_console_output(self, context, instance):
+        if instance.system_metadata.get('image_container_format') == CONTAINER_FORMAT_HYBRID_VM:
+            node = self._get_provider_node(instance)
+            clients = self._get_hybrid_service_clients_by_node(node)
+            self._clients_wait_hybrid_service_up(clients)
+            response = self._clients_get_console_output(clients)
+
+            if response['logs']:
+                return response['logs']
+            else:
+                return 'console output empty'
+
+    def get_vnc_console(self, context, instance):
+        LOG.debug("get_vnc_console")
+
+    def rebuild(self, context, instance, image_meta, injected_files,
+                admin_password, bdms, detach_block_devices,
+                attach_block_devices, network_info=None,
+                recreate=False, block_device_info=None,
+                preserve_ephemeral=False):
+        pass
 
 def qemu_img_info(path):
     """Return an object containing the parsed output from qemu-img info."""
